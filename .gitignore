@@ -1,0 +1,7 @@
+# Built binaries
+/bin/
+/dist/
+
+# ESC/POS captures + decoded round-trip proofs (regenerable)
+*.escpos
+sample/*_decoded*.png
