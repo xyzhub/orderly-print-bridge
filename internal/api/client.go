@@ -31,11 +31,18 @@ type Client struct {
 
 // New returns a Client with sane timeouts. An empty token is legal: the
 // enroll call is unauthenticated.
+//
+// 75 s, not 30: the artifact is rendered on demand by a Fly app that suspends
+// when idle, and its first render after a cold start measured 28.8 s on
+// staging (2026-09-07) — plus Orderly's own 20 s + one retry budget in front of
+// it. A shorter timeout turns every first slip after an idle period into
+// "context deadline exceeded" and a wasted lease. The ack deadline is separate
+// (bridge.DefaultAckTimeout).
 func New(baseURL string, token secret.Secret) *Client {
 	return &Client{
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		Token:   token,
-		HTTP:    &http.Client{Timeout: 30 * time.Second},
+		HTTP:    &http.Client{Timeout: 75 * time.Second},
 	}
 }
 
