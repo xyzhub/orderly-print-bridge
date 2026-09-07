@@ -27,10 +27,17 @@ correctly), and this bridge just wraps that image in printer commands. Native
 ESC/POS codepages cannot shape Arabic; rasterizing the shaped image is the
 universal workaround.
 
-**Deferred to a later mission (NOT in this MVP):** the Orderly-side job feed,
-polling, device pairing, auth tokens, retry/ack, and printer-error surfacing.
-Today the bridge prints an image you hand it. The poll→print→ack daemon wraps
-this engine later.
+The binary now has **two shapes**:
+
+| Shape | Command | What it does |
+|---|---|---|
+| Print engine (the original) | `--image … --printer …` | one-shot: rasterise an image and send it |
+| **Daemon** | `serve` | enroll, then poll Orderly for print jobs, print, acknowledge |
+
+**Deferred to Phase 4 (NOT built here):** printer discovery (the port-9100 /
+mDNS / USB sweep — v1 takes a printer address configured on the server), the
+PC download path with the claim code in the filename, signed installers and a
+self-updater, the Star dialect, Windows USB, and the cash-drawer kick.
 
 ---
 
@@ -190,6 +197,58 @@ The `GS v 0` raster bit-image command is supported by ~all 80mm thermal printers
 
 ---
 
+## The daemon (`serve`)
+
+```bash
+# First run on a box: reads the per-flash setup code from /etc/orderly/setup-code,
+# reads the DMI serial, enrolls, then polls every 3s.
+orderly-print-bridge serve --server https://orderly-staging.fly.dev
+
+# Enroll only (store the token and exit)
+orderly-print-bridge enroll --server https://orderly.example --code ABCDEFGHJK
+
+# One poll cycle, for a smoke test
+orderly-print-bridge serve --once
+```
+
+**Config file** — `{serverUrl, token, deviceId, venueId, printers[]}`, mode
+**0600**, at one path per OS:
+
+| OS | Path |
+|---|---|
+| Linux | `/etc/orderly/bridge.json` |
+| macOS | `/Library/Application Support/Orderly/bridge.json` |
+| Windows | `%ProgramData%\Orderly\bridge.json` (ACL: SYSTEM + Administrators) |
+
+`ORDERLY_BRIDGE_CONFIG` overrides the path. A world-readable file is rewritten
+to 0600 on load. The device token is a redacting type — it cannot reach stdout,
+a log line, an error string or an accidental `json.Marshal`; only the config
+file and the `Authorization` header ever hold the real value.
+
+**Identity.** The setup code comes from `/etc/orderly/setup-code` (written by
+the flash script beside the Tailscale key) plus the hardware serial — Linux
+`/sys/class/dmi/id/product_serial` then `board_serial`, Windows
+`Win32_BIOS.SerialNumber`, macOS `ioreg`. **A serial that cannot be read is not
+an error**: the setup code alone is then the identity. If no code file exists,
+the binary serves a setup page on `http://127.0.0.1:47831/` as a last resort.
+
+**Rules the loop will not break**
+
+- **Any byte written makes a failure terminal.** `transport.Send` returns the
+  byte count; a stall mid-receipt acks `failed{partial}` and is never
+  re-queued. Retrying after a partial write is how one order becomes two legal
+  invoices. Only a zero-byte failure is retryable.
+- **An artifact whose width ≠ the printer's `widthDots` acks
+  `failed{render_failed}` and prints nothing.** It is never resampled.
+- **A welcome slip is never sent blind.** Port 9100 is JetDirect, so the first
+  answer on the LAN can be an office LaserJet. A slip goes only to a printer
+  the server named, or — when it named none — to the single candidate, or to
+  the one candidate that answers the ESC/POS identity query `GS I`.
+  > **Whether the Bixolon SRP-E300 answers `GS I` is UNKNOWN** as of this
+  > build. It has not been tried on a bench. Do not assume it replies.
+- **Every job is acked within 60 s** or acked `failed{timeout}`.
+- **A 401 stops the loop** and reports "revoked".
+
 ## Samples
 
 - `sample/receipt.png` — the branded ZATCA simplified tax invoice (Arabic + QR).
@@ -206,16 +265,35 @@ Both are genuine Orderly-rendered receipts. Run them straight through:
 ## Layout
 
 ```
-main.go                       CLI (std flag) + orchestration
+main.go                       one-shot CLI (std flag) + command dispatch
+serve.go                      the `serve` / `enroll` commands
+internal/api/contract.go      EVERY /api/agent/v1 request+response type (one file,
+                              on purpose — reconciling against the merged server
+                              handlers is a one-file diff)
+internal/api/client.go        the HTTP client for that contract
+internal/api/apitest/         httptest fake of the contract, for the e2e tests
+internal/config/              bridge.json: three OS paths, 0600 / Windows ACL
+internal/enroll/              setup code + hardware serial + the loopback page
+internal/bridge/              the poll → artifact → raster → print → ack loop
+internal/secret/              a token type that redacts through fmt and json
 internal/escpos/raster.go     image → GS v 0 ESC/POS (resize, 1-bit, banding)
 internal/escpos/decode.go     ESC/POS → image (round-trip verification)
-internal/transport/           tcp:// · usb:// · file:// delivery
+internal/transport/           tcp:// · usb:// · file:// delivery, byte counts, GS I
 sample/                       real Orderly receipt PNGs
 ```
 
-## Roadmap (next mission, not this MVP)
+## Roadmap (Phase 4, after the client witness)
 
-Wrap this engine in the Orderly-driven **poll → print → ack** daemon: device
-pairing + token auth, the `PrintJob` feed, atomic claim (no duplicate prints),
-retry when offline, and printer-error surfacing (paper-out/offline). The server
-contract for that is already settled; this binary is the print step it calls.
+Printer discovery (port-9100 sweep + mDNS + USB), the PC download path with the
+claim code carried in the filename, signed Windows/macOS installers and a
+self-updater, the Star dialect, Windows USB via the spooler, and the
+cash-drawer kick (`ESC p`, carried by the job's `actions[]`).
+
+## Contract status
+
+The daemon was built against the **written** Orderly contract (the endpoint
+table and schema sketch in `docs/product/decisions/2026-09-07-print-bridge-memos.md`,
+the S3/S4 session briefs, and counsel findings 4, 6 and 9), because the server
+side had not merged yet. Every request/response type lives in
+`internal/api/contract.go` with its sources named at the top: reconcile that
+one file against `server/api/agent/v1/**` once Phase 1 is on staging.
