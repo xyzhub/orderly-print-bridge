@@ -1,10 +1,12 @@
 // orderly-print-bridge — print an Orderly receipt image to an ESC/POS thermal
 // printer, silently, with no CUPS/Avahi/browser dependency.
 //
-// MVP scope: the print ENGINE only. Given a rendered receipt PNG and a printer
-// target, convert it to an ESC/POS raster (GS v 0) and send it. The Orderly-side
-// job feed / poll / pairing / auth is a later mission (see the README's
-// "MVP boundary").
+// Two shapes in one binary:
+//
+//   - the one-shot CLI (--image / --printer / --width / --decode) that the
+//     paper tests drive by hand, unchanged;
+//   - `serve`, the daemon: enroll by setup code + hardware serial, then poll
+//     Orderly for print jobs, raster them and acknowledge (internal/bridge).
 package main
 
 import (
@@ -14,9 +16,11 @@ import (
 	_ "image/jpeg" // register JPEG decoder for --image inputs
 	"image/png"
 	"os"
+	"strings"
 
 	"github.com/xyz/orderly-print-bridge/internal/escpos"
 	"github.com/xyz/orderly-print-bridge/internal/transport"
+	"github.com/xyz/orderly-print-bridge/internal/version"
 )
 
 const usage = `orderly-print-bridge — image -> ESC/POS raster -> thermal printer
@@ -25,6 +29,12 @@ USAGE
   orderly-print-bridge --image receipt.png --printer tcp://192.168.1.50:9100
   orderly-print-bridge --image receipt.png --out receipt.escpos      (dry run)
   orderly-print-bridge --decode receipt.escpos --out roundtrip.png   (verify)
+
+COMMANDS
+  serve    run the daemon: enroll if needed, then poll Orderly for print jobs
+  enroll   claim a setup code and store the device token, then exit
+  version  print the agent version
+  (no command = the one-shot print/decode CLI below)
 
 FLAGS
   --image   <path>    receipt PNG/JPEG to print
@@ -47,6 +57,31 @@ func main() {
 }
 
 func run() error {
+	args := os.Args[1:]
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		switch args[0] {
+		case "serve":
+			return runServe(args[1:])
+		case "enroll":
+			return runEnroll(args[1:])
+		case "version":
+			fmt.Println(version.UserAgent)
+			return nil
+		case "print":
+			return runPrint(args[1:])
+		case "help":
+			fmt.Print(usage)
+			return nil
+		default:
+			return fmt.Errorf("unknown command %q (try: serve, enroll, version, or the --image flags)", args[0])
+		}
+	}
+	return runPrint(args)
+}
+
+// runPrint is the original one-shot CLI, unchanged in behaviour: it is what
+// the paper tests drive (--image --printer --width).
+func runPrint(args []string) error {
 	fs := flag.NewFlagSet("orderly-print-bridge", flag.ContinueOnError)
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 
@@ -61,7 +96,7 @@ func run() error {
 		fullCut   = fs.Bool("full-cut", false, "full cut instead of partial cut")
 		decode    = fs.String("decode", "", "decode an ESC/POS file back to PNG (writes to --out)")
 	)
-	if err := fs.Parse(os.Args[1:]); err != nil {
+	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
@@ -111,10 +146,11 @@ func run() error {
 	if *printer == "" {
 		return fmt.Errorf("need --printer <target> to print, or --out <file> for a dry run")
 	}
-	if err := transport.Send(*printer, stream); err != nil {
-		return fmt.Errorf("send to %s: %w", *printer, err)
+	n, err := transport.Send(*printer, stream)
+	if err != nil {
+		return fmt.Errorf("send to %s (%d of %d bytes sent): %w", *printer, n, len(stream), err)
 	}
-	fmt.Printf("sent %d bytes to %s\n", len(stream), *printer)
+	fmt.Printf("sent %d bytes to %s\n", n, *printer)
 	return nil
 }
 

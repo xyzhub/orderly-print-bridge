@@ -1,0 +1,88 @@
+# Builds and publishes the box container on a `v*` tag.
+#
+# The box image's first-boot unit pulls ghcr.io/xyzhub/orderly-print-bridge:v1,
+# so a tag of `v1.0.0` must produce BOTH `v1.0.0` and the moving `v1` — the
+# major tag is what a flashed box follows for a fix without being re-flashed.
+#
+# The tag is created by a human, never by this workflow: shipping a new image
+# to every client's counter is a decision, not a side effect of a merge.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  # The gate runs ONCE, natively, before anything is published. The Dockerfile
+  # also runs the suite, but only for the native arch — this job is what makes
+  # a green tag mean the same thing for arm64 (the t640 and the Pi) as for amd64.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: false
+      - run: go vet ./...
+      - run: go test ./... -count=1
+      - name: cross-compile every target the box or a PC can be
+        run: |
+          set -e
+          for target in linux/amd64 linux/arm64 linux/arm windows/amd64 darwin/arm64 darwin/amd64; do
+            GOOS=${target%/*} GOARCH=${target#*/} CGO_ENABLED=0 go build -o /dev/null .
+            echo "ok $target"
+          done
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern=v{{major}}.{{minor}}
+            type=semver,pattern=v{{major}}
+
+      # linux/amd64 + linux/arm64: the HP t640 is amd64, but an arm64 box (a Pi
+      # standing in for a t640 that cannot be sourced) must not need a rebuild.
+      # Cross-compiled by Go inside the build stage, so no QEMU.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: what shipped
+        run: |
+          echo "### Published" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,484 @@
+// Package bridge is the daemon: heartbeat → poll → artifact → raster → print →
+// ack, every 3 seconds, forever (master-plan tasks 23 and 24).
+//
+// The rules that are not negotiable, and why:
+//
+//   - transport.Send reports BYTES WRITTEN. Any byte that reached the printer
+//     makes the failure TERMINAL (`failed{partial}`, retryable false). A retry
+//     after a partial write is how a venue gets two legal invoices for one
+//     order (counsel finding 4). Only a zero-byte failure is retryable.
+//   - An artifact whose width is not the printer's widthDots acks
+//     `failed{render_failed}` and prints NOTHING. It is never resampled: a
+//     silently rescaled receipt is a quality regression discovered on paper,
+//     weeks later (escpos.Options.NoResample makes the resample branch
+//     unreachable from here).
+//   - A welcome slip is sent only to a printer the server named, or — when it
+//     named none — to the single candidate, or to the one candidate that
+//     answers `GS I`. Never "the first printer found": port 9100 is JetDirect
+//     and the first answer can be an office LaserJet (counsel finding 6).
+//   - Every job is acked within 60 s or acked `failed{timeout}`. The server's
+//     lease reclaim runs at 2 minutes, so a silent daemon is not a stuck job.
+//   - A 401 stops the loop: the device was revoked, and a revoked device that
+//     keeps polling is just noise in the rate limiter.
+package bridge
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"image"
+	_ "image/jpeg" // artifact decoders
+	_ "image/png"
+	"net/http"
+	"os"
+	"runtime"
+	"time"
+
+	"github.com/xyz/orderly-print-bridge/internal/api"
+	"github.com/xyz/orderly-print-bridge/internal/config"
+	"github.com/xyz/orderly-print-bridge/internal/escpos"
+	"github.com/xyz/orderly-print-bridge/internal/transport"
+	"github.com/xyz/orderly-print-bridge/internal/version"
+)
+
+// Defaults from memo 5 and master-plan task 23.
+const (
+	DefaultPollInterval      = 3 * time.Second
+	DefaultHeartbeatInterval = 30 * time.Second // the server throttles at 10 s
+	DefaultAckTimeout        = 60 * time.Second
+)
+
+// ErrRevoked ends Run: Orderly rejected the device token.
+var ErrRevoked = errors.New("bridge: device token rejected — this device has been revoked in Orderly")
+
+// Sender delivers bytes to a printer and reports how many arrived.
+type Sender func(target string, data []byte) (int, error)
+
+// Prober asks a printer target a short question (the `GS I` identity query).
+type Prober func(target string, cmd []byte) ([]byte, error)
+
+// Bridge is one enrolled device's print loop.
+type Bridge struct {
+	Client *api.Client
+	Cfg    *config.Config
+
+	Send  Sender
+	Probe Prober
+
+	PollInterval      time.Duration
+	HeartbeatInterval time.Duration
+	AckTimeout        time.Duration
+
+	Logf func(format string, args ...any)
+	Now  func() time.Time
+
+	lastHeartbeat time.Time
+	hostname      string
+}
+
+// New builds a Bridge for an enrolled config with production defaults.
+func New(cfg *config.Config) *Bridge {
+	host, err := os.Hostname()
+	if err != nil {
+		host = ""
+	}
+	return &Bridge{
+		Client:            api.New(cfg.ServerURL, cfg.Token),
+		Cfg:               cfg,
+		Send:              transport.Send,
+		Probe:             transport.Query,
+		PollInterval:      DefaultPollInterval,
+		HeartbeatInterval: DefaultHeartbeatInterval,
+		AckTimeout:        DefaultAckTimeout,
+		Now:               time.Now,
+		hostname:          host,
+	}
+}
+
+func (b *Bridge) logf(format string, args ...any) {
+	if b.Logf != nil {
+		b.Logf(format, args...)
+	}
+}
+
+func (b *Bridge) now() time.Time {
+	if b.Now != nil {
+		return b.Now()
+	}
+	return time.Now()
+}
+
+func (b *Bridge) defaults() {
+	if b.Send == nil {
+		b.Send = transport.Send
+	}
+	if b.Probe == nil {
+		b.Probe = transport.Query
+	}
+	if b.PollInterval <= 0 {
+		b.PollInterval = DefaultPollInterval
+	}
+	if b.HeartbeatInterval <= 0 {
+		b.HeartbeatInterval = DefaultHeartbeatInterval
+	}
+	if b.AckTimeout <= 0 {
+		b.AckTimeout = DefaultAckTimeout
+	}
+}
+
+// Run polls until the context is cancelled or the device is revoked.
+func (b *Bridge) Run(ctx context.Context) error {
+	b.defaults()
+	b.logf("bridge %s starting: device %s, venue %s, %d printer(s) assigned, polling every %s",
+		version.Version, b.Cfg.DeviceID, b.Cfg.VenueID, len(b.Cfg.Printers), b.PollInterval)
+
+	ticker := time.NewTicker(b.PollInterval)
+	defer ticker.Stop()
+	for {
+		if err := b.Tick(ctx); err != nil {
+			if errors.Is(err, ErrRevoked) {
+				b.logf("%v", err)
+				return err
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			// Everything else is transient — a venue's uplink, a deploy, a
+			// printer that is off. Keep polling; the queue is the point.
+			b.logf("poll cycle failed (will retry): %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// Tick runs one heartbeat-if-due + poll + (maybe) one job. Exported so tests
+// can drive the loop deterministically instead of sleeping.
+func (b *Bridge) Tick(ctx context.Context) error {
+	b.defaults()
+	if err := b.heartbeatIfDue(ctx); err != nil {
+		return err
+	}
+	resp, err := b.Client.Poll(ctx)
+	if err != nil {
+		return b.classify(err)
+	}
+	if resp.Job == nil {
+		return nil
+	}
+	return b.handle(ctx, resp.Job)
+}
+
+// classify turns a 401 into the loop-stopping ErrRevoked.
+func (b *Bridge) classify(err error) error {
+	if api.IsStatus(err, http.StatusUnauthorized) || api.IsStatus(err, http.StatusForbidden) {
+		return fmt.Errorf("%w (%v)", ErrRevoked, err)
+	}
+	return err
+}
+
+// PrintersDiscovered is what the heartbeat reports. In v1 the printer address
+// is configured on the server and there is no network sweep (LD-18 moved
+// discovery to Phase 4), so this is the count of printers Orderly has assigned
+// to this device. Zero is a normal state — it is precisely what lets the
+// manager page say "no printer yet" instead of leaving the box silent
+// (master-plan task 24).
+func (b *Bridge) PrintersDiscovered() int { return len(b.Cfg.Printers) }
+
+func (b *Bridge) heartbeatIfDue(ctx context.Context) error {
+	if !b.lastHeartbeat.IsZero() && b.now().Sub(b.lastHeartbeat) < b.HeartbeatInterval {
+		return nil
+	}
+	resp, err := b.Client.Heartbeat(ctx, api.HeartbeatRequest{
+		Version:            version.Version,
+		OS:                 runtime.GOOS,
+		Arch:               runtime.GOARCH,
+		Hostname:           b.hostname,
+		PrintersDiscovered: b.PrintersDiscovered(),
+	})
+	if err != nil {
+		return b.classify(err)
+	}
+	b.lastHeartbeat = b.now()
+	b.applyPrinters(resp.Printers)
+	return nil
+}
+
+// applyPrinters persists a changed printer assignment so a restart with no
+// network still knows where to print the backlog.
+func (b *Bridge) applyPrinters(printers []api.Printer) {
+	if samePrinters(b.Cfg.Printers, printers) {
+		return
+	}
+	b.Cfg.Printers = printers
+	if err := b.Cfg.Save(); err != nil {
+		b.logf("could not persist the printer assignment: %v", err)
+		return
+	}
+	b.logf("printer assignment updated: %d printer(s)", len(printers))
+}
+
+func samePrinters(a, bb []api.Printer) bool {
+	if len(a) != len(bb) {
+		return false
+	}
+	for i := range a {
+		if a[i] != bb[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// jobOutcome is what one attempt produced.
+type jobOutcome struct {
+	printed bool
+	// voided means the server already terminated the job (artifact 410): ack
+	// `voided`, which artifact.get.ts names as the expected daemon answer.
+	voided    bool
+	bytes     int
+	reason    string
+	detail    string
+	retryable bool
+	// noAck means: say nothing and let the server re-queue or reclaim. Used
+	// when the lease was lost (409) or the artifact could not be fetched at
+	// all — acking a job we do not hold is noise at best.
+	noAck bool
+	err   error
+}
+
+func (b *Bridge) handle(ctx context.Context, job *api.Job) error {
+	printer, reason := b.selectPrinter(job)
+	if printer == nil {
+		b.logf("job %s (%s): %s — nothing printed", job.ID, job.Kind, reason)
+		return b.ack(ctx, job, api.Failed("", api.FailNoPrinter, reason, 0, false))
+	}
+
+	// One 60 s budget for artifact + raster + write, so a wedged printer can
+	// never hold a claim past the server's lease.
+	jobCtx, cancel := context.WithTimeout(ctx, b.AckTimeout)
+	defer cancel()
+
+	done := make(chan jobOutcome, 1)
+	go func() { done <- b.execute(jobCtx, job, *printer) }()
+
+	select {
+	case out := <-done:
+		return b.report(ctx, job, *printer, out)
+	case <-jobCtx.Done():
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		// Bytes written is unknown, so this is terminal, not retryable —
+		// the honest reading of "we do not know whether paper moved".
+		b.logf("job %s (%s): did not finish within %s; acking failed{timeout}", job.ID, job.Kind, b.AckTimeout)
+		return b.ack(ctx, job, api.Failed(printer.ID, api.FailTimeout,
+			fmt.Sprintf("no result within the %s ack window; bytes written unknown", b.AckTimeout), 0, false))
+	}
+}
+
+func (b *Bridge) execute(ctx context.Context, job *api.Job, printer api.Printer) jobOutcome {
+	artifact, err := b.Client.Artifact(ctx, job.ID)
+	if err != nil {
+		switch {
+		case api.IsStatus(err, http.StatusGone):
+			// Voided (the cashier printed in the browser) or expired. Already
+			// terminal server-side; ack `voided` and print nothing.
+			return jobOutcome{voided: true, detail: "artifact_gone: the job was voided or expired before it printed", err: err}
+		case api.IsStatus(err, http.StatusConflict):
+			// lease_lost: the server reclaimed this lease and RE-QUEUED the
+			// job. Abandon it silently — acking would fight the re-queue, and
+			// the next poll picks it up properly.
+			return jobOutcome{noAck: true, err: err}
+		case api.IsStatus(err, http.StatusNotImplemented):
+			// kind_not_renderable_yet — the S5 slip-route seam. Terminal:
+			// waiting will not make the server grow a renderer.
+			return jobOutcome{reason: api.FailRenderFailed,
+				detail: "the server cannot render this job kind yet (kind_not_renderable_yet)", err: err}
+		case api.IsStatus(err, http.StatusBadGateway):
+			// The render app failed. Zero bytes reached paper, so a retry is
+			// both safe and likely to work.
+			return jobOutcome{reason: api.FailRenderFailed, retryable: true,
+				detail: "the render service could not produce the receipt", err: err}
+		case api.IsStatus(err, http.StatusUnauthorized):
+			return jobOutcome{noAck: true, err: b.classify(err)}
+		case api.IsStatus(err, http.StatusForbidden):
+			// job_not_owned — not ours, or gone. The ack would 403 too.
+			return jobOutcome{noAck: true, err: err}
+		default:
+			// A transient fetch failure: stay silent and let the lease reclaim it.
+			return jobOutcome{noAck: true, err: err}
+		}
+	}
+
+	img, _, err := image.Decode(bytes.NewReader(artifact))
+	if err != nil {
+		return jobOutcome{reason: api.FailRenderFailed,
+			detail: "the artifact was not a decodable image",
+			err:    fmt.Errorf("artifact is not a decodable image: %w", err)}
+	}
+
+	// The width gate. This is checked BEFORE encoding as well as inside
+	// escpos (NoResample) so the failure is named precisely and no bytes are
+	// ever built for the wrong head.
+	got := img.Bounds().Dx()
+	if printer.WidthDots <= 0 {
+		return jobOutcome{reason: api.FailRenderFailed,
+			detail: "this printer has no paper width configured",
+			err:    fmt.Errorf("printer %s has no paper width configured", printer.Name)}
+	}
+	if got != printer.WidthDots {
+		detail := fmt.Sprintf("artifact is %d dots wide but this printer prints %d; refusing to resample", got, printer.WidthDots)
+		return jobOutcome{reason: api.FailRenderFailed, detail: detail,
+			err: fmt.Errorf("artifact is %d dots wide but %s prints %d dots; refusing to resample",
+				got, printer.Name, printer.WidthDots)}
+	}
+
+	opts := escpos.Options{
+		Width:      printer.WidthDots,
+		Threshold:  thresholdOrDefault(printer.Threshold),
+		BandHeight: bandOrDefault(printer.BandHeight),
+		NoResample: true,
+	}
+	stream, err := escpos.Encode(img, opts)
+	if err != nil {
+		return jobOutcome{reason: api.FailRenderFailed, detail: err.Error(), err: err}
+	}
+
+	n, err := b.Send(printer.Target(), stream)
+	if err != nil {
+		if n > 0 {
+			// TERMINAL. Paper moved; a retry prints a second copy. The server
+			// re-derives this from bytesWritten too (ack.ts rule 2).
+			return jobOutcome{bytes: n, reason: api.FailPartial, retryable: false,
+				detail: truncate(err.Error()), err: err}
+		}
+		return jobOutcome{bytes: 0, reason: api.FailOffline, retryable: true,
+			detail: truncate(err.Error()), err: err}
+	}
+	return jobOutcome{printed: true, bytes: n}
+}
+
+func (b *Bridge) report(ctx context.Context, job *api.Job, printer api.Printer, out jobOutcome) error {
+	switch {
+	case out.noAck:
+		b.logf("job %s (%s): %v — leaving it for the server to reclaim", job.ID, job.Kind, out.err)
+		return out.err
+	case out.printed:
+		b.logf("job %s (%s): printed %d bytes on %s", job.ID, job.Kind, out.bytes, printer.Name)
+		return b.ack(ctx, job, api.Printed(printer.ID, out.bytes))
+	case out.voided:
+		b.logf("job %s (%s): %v — acking voided, nothing printed", job.ID, job.Kind, out.err)
+		return b.ack(ctx, job, api.Voided(printer.ID, out.detail))
+	default:
+		b.logf("job %s (%s): failed{%s} after %d byte(s) on %s: %v",
+			job.ID, job.Kind, out.reason, out.bytes, printer.Name, out.err)
+		return b.ack(ctx, job, api.Failed(printer.ID, out.reason, out.detail, out.bytes, out.retryable))
+	}
+}
+
+// ack always runs on a fresh, short context: the job context may already be
+// dead, and an unacked job is a job the venue watches expire.
+func (b *Bridge) ack(ctx context.Context, job *api.Job, body api.AckRequest) error {
+	ackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+	if err := b.Client.Ack(ackCtx, job.ID, body); err != nil {
+		return b.classify(err)
+	}
+	return nil
+}
+
+// selectPrinter decides where a job prints, and is where counsel finding 6
+// lives. A server-named printer is a deliberate assignment and is obeyed.
+//
+// As merged, `poll.ts` claims a job ONLY when the role's printer belongs to
+// this device, so `job.printer` is non-null on every job the server hands out
+// and the branch below is defence rather than a normal path: it survives so a
+// future welcome/test slip issued before any role exists still cannot be
+// printed blind.
+func (b *Bridge) selectPrinter(job *api.Job) (*api.Printer, string) {
+	if job.Printer != nil && job.Printer.Address != "" {
+		p := *job.Printer
+		if p.WidthDots == 0 && job.Dots > 0 {
+			p.WidthDots = job.Dots
+		}
+		return &p, ""
+	}
+	if job.Kind != api.KindWelcome && job.Kind != api.KindTest {
+		return nil, "the server did not name a printer for this job"
+	}
+	return b.WelcomeTarget()
+}
+
+// WelcomeTarget applies the never-blind rule to the assigned printers.
+func (b *Bridge) WelcomeTarget() (*api.Printer, string) {
+	b.defaults()
+	return selectWelcomeTarget(b.Cfg.Printers, b.Probe, b.logf)
+}
+
+func selectWelcomeTarget(candidates []api.Printer, probe Prober, logf func(string, ...any)) (*api.Printer, string) {
+	switch len(candidates) {
+	case 0:
+		return nil, "no printer is configured for this device yet"
+	case 1:
+		p := candidates[0]
+		return &p, ""
+	}
+
+	// More than one candidate: only a printer that ANSWERS `GS I` may receive
+	// an unsolicited slip. Whether a given model answers is a per-model fact —
+	// the Bixolon SRP-E300's behaviour is UNKNOWN as of this build and must be
+	// observed on a bench, never assumed.
+	var identified []api.Printer
+	for _, c := range candidates {
+		reply, err := probe(c.Target(), escpos.CmdIdentity)
+		if err != nil {
+			if !errors.Is(err, transport.ErrQueryUnsupported) {
+				logf("identity query to %s failed: %v", c.Name, err)
+			}
+			continue
+		}
+		if len(reply) == 0 {
+			continue
+		}
+		identified = append(identified, c)
+	}
+	if len(identified) == 1 {
+		p := identified[0]
+		return &p, ""
+	}
+	if len(identified) == 0 {
+		return nil, fmt.Sprintf("%d printers are configured and none identified itself as an ESC/POS printer; "+
+			"not sending a slip blind", len(candidates))
+	}
+	return nil, fmt.Sprintf("%d printers answered the identity query; "+
+		"assign the receipt role in Orderly to say which one", len(identified))
+}
+
+// truncate keeps a driver string inside the server's 300-char `lastError`
+// budget so nothing is silently cut mid-word on the manager surface.
+func truncate(s string) string {
+	const max = 280
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
+}
+
+func thresholdOrDefault(v int) uint8 {
+	if v <= 0 || v > 255 {
+		return 128
+	}
+	return uint8(v)
+}
+
+func bandOrDefault(v int) int {
+	if v <= 0 {
+		return 128
+	}
+	return v
+}

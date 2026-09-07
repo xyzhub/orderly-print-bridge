@@ -25,6 +25,15 @@ var (
 	cmdFullCut  = []byte{0x1d, 0x56, 0x00}       // GS V 0     full cut
 )
 
+// CmdIdentity is the ESC/POS identity query `GS I 1` (transmit printer model
+// ID). It is how a candidate on port 9100 is asked to prove it is a thermal
+// printer before a welcome slip is sent to it — an office LaserJet answers
+// nothing and prints a page of garbage instead (counsel finding 6).
+//
+// Not every ESC/POS printer implements it. Silence therefore means "not
+// identified", never "not a printer".
+var CmdIdentity = []byte{0x1d, 0x49, 0x01}
+
 // Options controls the image -> ESC/POS conversion.
 type Options struct {
 	// Width is the target raster width in dots (80mm @ 203dpi = 576).
@@ -41,6 +50,13 @@ type Options struct {
 	Center bool
 	// FullCut emits GS V 0 (full cut) instead of GS V 66 0 (partial cut).
 	FullCut bool
+	// NoResample rejects, instead of rescaling, a source image whose width is
+	// not already Width. The server renders the artifact at the printer's
+	// widthDots; if what arrives is a different width, something upstream is
+	// wrong and quietly rescaling it is a silent quality regression the venue
+	// only discovers on paper. The daemon always sets this; the CLI does not,
+	// because a human passing --image --width is asking for a resize.
+	NoResample bool
 	// BandHeight splits the raster into horizontal bands of this many rows,
 	// one GS v 0 command each. Cheap printer firmwares choke on a single
 	// multi-thousand-row command; banding keeps each command small. 0 selects
@@ -51,6 +67,17 @@ type Options struct {
 // DefaultOptions returns sane defaults for an 80mm thermal receipt.
 func DefaultOptions() Options {
 	return Options{Width: 576, Dither: false, Threshold: 128, Center: false, BandHeight: 128}
+}
+
+// WidthMismatchError reports a source image whose width does not match the
+// requested raster width while NoResample is set.
+type WidthMismatchError struct {
+	Got  int
+	Want int
+}
+
+func (e *WidthMismatchError) Error() string {
+	return fmt.Sprintf("image is %d dots wide but this printer prints %d dots; refusing to resample", e.Got, e.Want)
 }
 
 // Encode converts a decoded image into a complete, ready-to-print ESC/POS
@@ -76,6 +103,9 @@ func Encode(src image.Image, opts Options) ([]byte, error) {
 		return nil, fmt.Errorf("source image is empty")
 	}
 	dstW := opts.Width
+	if opts.NoResample && srcW != dstW {
+		return nil, &WidthMismatchError{Got: srcW, Want: dstW}
+	}
 	dstH := srcH * dstW / srcW
 	if dstH < 1 {
 		dstH = 1
@@ -156,6 +186,8 @@ func toGray(src image.Image) *image.Gray {
 // integrates each destination pixel over its full source footprint, which
 // keeps thin strokes and QR modules legible where nearest-neighbour would
 // drop them. No external image library required.
+// With Options.NoResample set (every daemon path) srcW == dstW, so dstH ==
+// srcH and this function takes the copy branch below without ever resampling.
 func resizeGrayBox(src *image.Gray, dstW, dstH int) *image.Gray {
 	sb := src.Bounds()
 	srcW, srcH := sb.Dx(), sb.Dy()
