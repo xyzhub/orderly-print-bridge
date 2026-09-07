@@ -202,8 +202,11 @@ func TestZeroByteFailureIsRetryable(t *testing.T) {
 	if len(acks) != 1 {
 		t.Fatalf("want one ack, got %d", len(acks))
 	}
-	if acks[0].Body.FailureReason != api.FailUnreachable || !acks[0].Body.Retryable {
-		t.Fatalf("a zero-byte failure must be retryable{unreachable}, got %+v", acks[0].Body)
+	if acks[0].Body.FailureReason != api.FailOffline || !acks[0].Body.Retryable {
+		t.Fatalf("a zero-byte failure must be retryable{offline}, got %+v", acks[0].Body)
+	}
+	if acks[0].Body.LastError == "" {
+		t.Fatal("the driver string must travel in lastError for the human")
 	}
 }
 
@@ -404,24 +407,93 @@ func TestJobThatOverrunsTheAckWindowAcksTimeout(t *testing.T) {
 	}
 }
 
-// A 410 on the artifact means the job was voided (the cashier printed in the
-// browser) or expired. Nothing prints; the outcome is terminal.
-func TestVoidedArtifactAcksTerminal(t *testing.T) {
-	srv := apitest.New(t)
-	printer, sinkPath := fileSink(t, 512)
-	b := newBridge(t, srv, printer)
-	srv.Enqueue(api.Job{ID: "job_void", Kind: api.KindReceipt, Printer: &printer, Dots: 512}, nil)
-	srv.ArtifactStatus["job_void"] = 410
+// The artifact's status ladder, as merged (artifact.get.ts). Each row is a
+// different decision, and getting one wrong either reprints a voided invoice
+// or strands a job.
+func TestArtifactStatusLadder(t *testing.T) {
+	cases := []struct {
+		name       string
+		status     int
+		wantAcks   int
+		wantStatus string
+		wantReason string
+		retryable  bool
+	}{
+		// 410: voided by a browser print, or expired. Already terminal
+		// server-side; the handler names `voided` as the daemon's answer.
+		{"410 voided", 410, 1, api.StatusVoided, "", false},
+		// 409 lease_lost: the server RE-QUEUED it. Acking would fight the
+		// re-queue — abandon it and let the next poll claim it properly.
+		{"409 lease_lost", 409, 0, "", "", false},
+		// 403: not ours (or gone). The ack would 403 too.
+		{"403 job_not_owned", 403, 0, "", "", false},
+		// 501: the S5 slip-route seam. Waiting will not grow a renderer.
+		{"501 not renderable", 501, 1, api.StatusFailed, api.FailRenderFailed, false},
+		// 502: the render app failed. Zero bytes reached paper, so retry.
+		{"502 render failed", 502, 1, api.StatusFailed, api.FailRenderFailed, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := apitest.New(t)
+			printer, sinkPath := fileSink(t, 512)
+			b := newBridge(t, srv, printer)
+			srv.Enqueue(api.Job{ID: "job_x", Kind: api.KindReceipt, Printer: &printer, Dots: 512}, nil)
+			srv.ArtifactStatus["job_x"] = tc.status
 
-	if err := b.Tick(context.Background()); err != nil {
-		t.Fatalf("tick: %v", err)
+			// A no-ack outcome surfaces the fetch error to the caller; that is
+			// expected, not a test failure.
+			_ = b.Tick(context.Background())
+
+			acks := srv.Acks()
+			if len(acks) != tc.wantAcks {
+				t.Fatalf("want %d ack(s), got %d: %+v", tc.wantAcks, len(acks), acks)
+			}
+			if tc.wantAcks > 0 {
+				if acks[0].Body.Status != tc.wantStatus {
+					t.Fatalf("status = %q, want %q", acks[0].Body.Status, tc.wantStatus)
+				}
+				if acks[0].Body.FailureReason != tc.wantReason {
+					t.Fatalf("failureReason = %q, want %q", acks[0].Body.FailureReason, tc.wantReason)
+				}
+				if acks[0].Body.Retryable != tc.retryable {
+					t.Fatalf("retryable = %v, want %v", acks[0].Body.Retryable, tc.retryable)
+				}
+			}
+			if _, err := os.Stat(sinkPath); !os.IsNotExist(err) {
+				t.Fatal("nothing may reach the printer when the artifact did not arrive")
+			}
+		})
 	}
-	acks := srv.Acks()
-	if len(acks) != 1 || acks[0].Body.FailureReason != api.FailArtifactGone || acks[0].Body.Retryable {
-		t.Fatalf("want a terminal failed{artifact_gone}, got %+v", acks)
+}
+
+// Every ack the daemon sends must stay inside the server's stored vocabulary
+// and must not carry the deprecated `error` alias.
+func TestAcksUseTheServersVocabularyAndDropTheAlias(t *testing.T) {
+	srv := apitest.New(t)
+	printer, _ := fileSink(t, 512)
+	b := newBridge(t, srv, printer)
+	b.Send = func(string, []byte) (int, error) { return 0, errors.New("connection refused") }
+	srv.Enqueue(api.Job{ID: "j1", Kind: api.KindReceipt, Printer: &printer, Dots: 512}, makePNG(t, 512, 80))
+	srv.Enqueue(api.Job{ID: "j2", Kind: api.KindReceipt, Printer: &printer, Dots: 512}, makePNG(t, 576, 80))
+	_ = b.Tick(context.Background())
+	_ = b.Tick(context.Background())
+
+	known := map[string]bool{}
+	for _, r := range api.FailureReasons {
+		known[r] = true
 	}
-	if _, err := os.Stat(sinkPath); !os.IsNotExist(err) {
-		t.Fatal("a voided job must not reach the printer")
+	for _, a := range srv.Acks() {
+		if a.Body.FailureReason != "" && !known[a.Body.FailureReason] {
+			t.Errorf("job %s acked an unstorable reason %q", a.JobID, a.Body.FailureReason)
+		}
+	}
+	for i, raw := range srv.RawAcks() {
+		if _, ok := raw["error"]; ok {
+			t.Errorf("ack %d still sends the deprecated `error` key: %v", i, raw)
+		}
+		if _, ok := raw["lastError"]; !ok {
+			t.Errorf("ack %d sent no lastError for the human: %v", i, raw)
+		}
 	}
 }
 

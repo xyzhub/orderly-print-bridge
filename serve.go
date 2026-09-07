@@ -192,17 +192,25 @@ func loadOrEnroll(ctx context.Context, c *commonFlags) (*config.Config, error) {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		// A code that expired or was already claimed will never succeed by
-		// waiting: an operator has to act. Say so once and stop.
-		if errors.Is(err, enroll.ErrCodeExpired) || errors.Is(err, enroll.ErrAlreadyClaimed) ||
-			errors.Is(err, enroll.ErrUnknownCode) {
+		// An expired, spent, malformed, unknown or revoked code will never
+		// succeed by waiting: an operator has to act. Say so once and stop
+		// rather than filling the fail-closed limiter (10 per IP / 15 min).
+		if enroll.Terminal(err) {
 			return nil, fmt.Errorf("%s", enroll.OperatorMessage(err))
 		}
-		logger.Printf("enrollment attempt %d failed: %v; retrying in %s", attempt, err, backoff)
+		wait := backoff
+		if errors.Is(err, enroll.ErrRateLimited) {
+			// The limiter's window is 15 minutes; a 5-second retry is what
+			// keeps it closed. Never hot-retry a 429.
+			if wait < time.Minute {
+				wait = time.Minute
+			}
+		}
+		logger.Printf("enrollment attempt %d failed: %v; retrying in %s", attempt, err, wait)
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(backoff):
+		case <-time.After(wait):
 		}
 		if backoff < 2*time.Minute {
 			backoff *= 2

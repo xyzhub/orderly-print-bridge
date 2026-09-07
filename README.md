@@ -289,11 +289,38 @@ claim code carried in the filename, signed Windows/macOS installers and a
 self-updater, the Star dialect, Windows USB via the spooler, and the
 cash-drawer kick (`ESC p`, carried by the job's `actions[]`).
 
+## The box container
+
+```bash
+docker run -d --restart=unless-stopped \
+  -v /etc/orderly:/etc/orderly \
+  -v /sys/class/dmi/id:/sys/class/dmi/id:ro \
+  ghcr.io/xyzhub/orderly-print-bridge:v1 --server https://orderly.example
+```
+
+`scratch` base, static binary, runs as root — the DMI serial is root-only in
+the kernel and the config file is 0600. Debugging is `docker logs` from the
+Debian host over Tailscale SSH; there is deliberately no shell in the image.
+`.github/workflows/release.yml` publishes `linux/amd64` + `linux/arm64` to GHCR
+on a `v*` tag (a human creates the tag — shipping to every client's counter is
+a decision, not a merge side effect). A `v1.0.0` tag also moves `:v1`, which is
+the tag a flashed box follows.
+
 ## Contract status
 
-The daemon was built against the **written** Orderly contract (the endpoint
-table and schema sketch in `docs/product/decisions/2026-09-07-print-bridge-memos.md`,
-the S3/S4 session briefs, and counsel findings 4, 6 and 9), because the server
-side had not merged yet. Every request/response type lives in
-`internal/api/contract.go` with its sources named at the top: reconcile that
-one file against `server/api/agent/v1/**` once Phase 1 is on staging.
+**Reconciled 2026-09-07** against the merged Phase-1 handlers (Orderly branch
+`mission/print-bridge-p1` at `9b6d6de3`). Every request/response type lives in
+`internal/api/contract.go`, which names the exact handler and util files it
+mirrors. What the reconciliation changed: the ack now sends
+`{failureReason, lastError}` and no longer the deprecated `error` alias;
+`failureReason` is coerced into the server's six stored tokens
+(`timeout|offline|partial|no_printer|render_failed|unknown`) with the daemon's
+own word kept in `lastError`; enrollment tells apart all six status/code pairs
+including the two distinct 409s (`already_claimed` vs `serial_conflict`); the
+device token is validated against `odb_` + 43 base64url chars before it is
+stored; and the artifact's ladder is honoured — 410 acks `voided`, 409
+`lease_lost` abandons the job to the server's re-queue, 501/502 ack
+`render_failed` (only 502 retryable).
+
+`welcome` / `test` artifacts answer 501 `kind_not_renderable_yet` until S5's
+slip routes merge; the daemon prints their PNGs like any other once they land.

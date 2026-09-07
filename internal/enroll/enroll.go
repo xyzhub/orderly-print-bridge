@@ -33,22 +33,38 @@ import (
 // LocalPageAddr is the loopback address of the last-resort code page.
 const LocalPageAddr = "127.0.0.1:47831"
 
-// The four outcomes a claim can have that the operator must be able to tell
-// apart. Compare with errors.Is.
+// The outcomes a claim can have that the operator must be able to tell apart.
+// One error per status/code pair `ENROLL_FAILURE_STATUS` (enrollment.ts:161)
+// can produce, because an installer that cannot tell "wrong code" from
+// "already used" sends the operator to the wrong fix. Compare with errors.Is.
 var (
-	// ErrCodeExpired — HTTP 410. The code aged out. Mint a new one.
+	// ErrCodeExpired — 410 `code_expired`. A PC code aged out. Box codes never
+	// reach this state. NOT a conflict, and it must never raise the "claimed
+	// twice" alarm (counsel finding 9).
 	ErrCodeExpired = errors.New("enroll: setup code has expired")
-	// ErrAlreadyClaimed — HTTP 409. Some device already used this code.
-	// THIS is the one that means "investigate"; expiry never does.
+	// ErrAlreadyClaimed — 409 `already_claimed`. A spent code: replay or
+	// spoof. THIS is the one that means "investigate".
 	ErrAlreadyClaimed = errors.New("enroll: setup code was already claimed")
-	// ErrUnknownCode — HTTP 400/404. Mistyped or from another environment.
+	// ErrSerialConflict — 409 `serial_conflict`. The hardware serial already
+	// belongs to another device in this organization. A different fix
+	// entirely: it is the BOX that is duplicated, not the code.
+	ErrSerialConflict = errors.New("enroll: this hardware serial already belongs to another device")
+	// ErrInvalidCode — 400 `invalid_code`. Not well-formed; no database work
+	// was done, so nothing was consumed.
+	ErrInvalidCode = errors.New("enroll: setup code is not well-formed")
+	// ErrUnknownCode — 404 `unknown_code`. Well-formed but no such code.
 	ErrUnknownCode = errors.New("enroll: setup code is not recognised")
-	// ErrRateLimited — HTTP 429 from the fail-closed agent-enroll limiter.
+	// ErrDeviceRevoked — 403 `device_revoked`. Enrolment is not a way back
+	// from a revocation.
+	ErrDeviceRevoked = errors.New("enroll: this device was revoked in Orderly")
+	// ErrRateLimited — 429 from the fail-closed `agent-enroll` limiter
+	// (10 per IP per 15 minutes). Back off; never hot-retry.
 	ErrRateLimited = errors.New("enroll: too many enrollment attempts, wait and retry")
 )
 
-// Claim exchanges a setup code for a device token, mapping the contract's
-// status codes onto distinguishable errors.
+// Claim exchanges a setup code for a device token, mapping the merged
+// handler's status+code pairs onto distinguishable errors. The status is the
+// primary discriminator; the machine code splits the two 409s.
 func Claim(ctx context.Context, client *api.Client, req api.EnrollRequest) (*api.EnrollResponse, error) {
 	resp, err := client.Enroll(ctx, req)
 	if err == nil {
@@ -57,15 +73,30 @@ func Claim(ctx context.Context, client *api.Client, req api.EnrollRequest) (*api
 	switch {
 	case api.IsStatus(err, http.StatusGone):
 		return nil, fmt.Errorf("%w (%v)", ErrCodeExpired, err)
+	case api.IsStatus(err, http.StatusConflict) && api.IsCode(err, api.CodeSerialConflict):
+		return nil, fmt.Errorf("%w (%v)", ErrSerialConflict, err)
 	case api.IsStatus(err, http.StatusConflict):
 		return nil, fmt.Errorf("%w (%v)", ErrAlreadyClaimed, err)
-	case api.IsStatus(err, http.StatusNotFound), api.IsStatus(err, http.StatusBadRequest):
+	case api.IsStatus(err, http.StatusForbidden):
+		return nil, fmt.Errorf("%w (%v)", ErrDeviceRevoked, err)
+	case api.IsStatus(err, http.StatusNotFound):
 		return nil, fmt.Errorf("%w (%v)", ErrUnknownCode, err)
+	case api.IsStatus(err, http.StatusBadRequest):
+		return nil, fmt.Errorf("%w (%v)", ErrInvalidCode, err)
 	case api.IsStatus(err, http.StatusTooManyRequests):
 		return nil, fmt.Errorf("%w (%v)", ErrRateLimited, err)
 	default:
 		return nil, err
 	}
+}
+
+// Terminal reports whether waiting could ever help. A code that expired, was
+// claimed, or does not exist will not start working on its own — an operator
+// has to act, and a daemon that keeps retrying just fills the limiter.
+func Terminal(err error) bool {
+	return errors.Is(err, ErrCodeExpired) || errors.Is(err, ErrAlreadyClaimed) ||
+		errors.Is(err, ErrSerialConflict) || errors.Is(err, ErrInvalidCode) ||
+		errors.Is(err, ErrUnknownCode) || errors.Is(err, ErrDeviceRevoked)
 }
 
 // OperatorMessage is the single line the daemon prints (and the box's console
@@ -79,6 +110,12 @@ func OperatorMessage(err error) string {
 		return "This box's setup code has expired. Generate a new code in Orderly (Admin › Boxes) and re-flash the code file — nothing was claimed by anyone else."
 	case errors.Is(err, ErrAlreadyClaimed):
 		return "This setup code was already used by another device. If that was not you, reset the device in Orderly (Admin › Boxes) to mint a fresh code."
+	case errors.Is(err, ErrSerialConflict):
+		return "Another device in this organization is already registered with this hardware serial. Reset or remove the old device in Orderly (Admin \u203a Boxes) before enrolling this one."
+	case errors.Is(err, ErrInvalidCode):
+		return "This setup code is not well-formed \u2014 it should be 10 characters. Nothing was claimed; check the code file on the USB stick."
+	case errors.Is(err, ErrDeviceRevoked):
+		return "This device was revoked in Orderly. Enrolling again will not undo that \u2014 an admin has to reset the device first."
 	case errors.Is(err, ErrUnknownCode):
 		return "Orderly does not recognise this setup code. Check it was generated for this environment."
 	case errors.Is(err, ErrRateLimited):

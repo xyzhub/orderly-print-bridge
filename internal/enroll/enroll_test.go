@@ -173,9 +173,12 @@ func TestExpiredAndConflictAreReportedDistinctly(t *testing.T) {
 	if !strings.Contains(strings.ToLower(msgClaimed), "already") {
 		t.Errorf("the conflict message should say so: %q", msgClaimed)
 	}
-	// All four outcomes are distinguishable.
+	// Every outcome is distinguishable.
 	seen := map[string]bool{}
-	for _, err := range []error{ErrCodeExpired, ErrAlreadyClaimed, ErrUnknownCode, ErrRateLimited, nil} {
+	for _, err := range []error{
+		ErrCodeExpired, ErrAlreadyClaimed, ErrSerialConflict, ErrInvalidCode,
+		ErrUnknownCode, ErrDeviceRevoked, ErrRateLimited, nil,
+	} {
 		m := OperatorMessage(err)
 		if seen[m] {
 			t.Errorf("duplicate operator message: %q", m)
@@ -303,4 +306,102 @@ func TestLocalCodePageAcceptsATypedCode(t *testing.T) {
 
 func sprintf(format string, args ...any) string {
 	return fmt.Sprintf(format, args...) + "\n"
+}
+
+// The merged handler returns TWO different 409s (enrollment.ts:161). Reading
+// only the status would send an operator hunting a stolen code when the real
+// fault is a duplicated box.
+func TestTheTwo409sAreToldApart(t *testing.T) {
+	conflict := apitest.New(t)
+	conflict.SerialConflict = true
+	_, err := Claim(context.Background(), api.New(conflict.URL(), ""),
+		api.EnrollRequest{Code: conflict.Code, Serial: "CZC1234ABC"})
+
+	if !errors.Is(err, ErrSerialConflict) {
+		t.Fatalf("409 serial_conflict must map to ErrSerialConflict, got %v", err)
+	}
+	if errors.Is(err, ErrAlreadyClaimed) {
+		t.Fatal("a duplicated serial is not a spent code")
+	}
+	if !strings.Contains(strings.ToLower(OperatorMessage(err)), "serial") {
+		t.Errorf("the message should name the serial: %q", OperatorMessage(err))
+	}
+}
+
+func TestRevokedAndMalformedCodesAreTheirOwnOutcomes(t *testing.T) {
+	revoked := apitest.New(t)
+	revoked.DeviceRevoked = true
+	err := mustFailClaim(t, revoked, revoked.Code)
+	if !errors.Is(err, ErrDeviceRevoked) {
+		t.Fatalf("403 must map to ErrDeviceRevoked, got %v", err)
+	}
+
+	unknown := apitest.New(t)
+	err = mustFailClaim(t, unknown, "ZZZZZZZZZZ")
+	if !errors.Is(err, ErrUnknownCode) {
+		t.Fatalf("404 must map to ErrUnknownCode, got %v", err)
+	}
+
+	invalid := apitest.New(t)
+	err = mustFailClaim(t, invalid, "")
+	if !errors.Is(err, ErrInvalidCode) {
+		t.Fatalf("400 must map to ErrInvalidCode, got %v", err)
+	}
+}
+
+// Every one of these means an operator has to act; retrying just fills the
+// fail-closed limiter.
+func TestTerminalOutcomesDoNotInviteARetry(t *testing.T) {
+	for _, err := range []error{
+		ErrCodeExpired, ErrAlreadyClaimed, ErrSerialConflict,
+		ErrInvalidCode, ErrUnknownCode, ErrDeviceRevoked,
+	} {
+		if !Terminal(err) {
+			t.Errorf("%v should be terminal", err)
+		}
+	}
+	if Terminal(ErrRateLimited) {
+		t.Error("a rate limit clears on its own — back off, do not give up")
+	}
+	if Terminal(errors.New("dial tcp: connection refused")) {
+		t.Error("a network failure is not terminal")
+	}
+}
+
+// device-token.ts mints `odb_` + 43 base64url chars. A token that cannot
+// possibly authenticate must fail loudly at enrollment, not silently 401 in a
+// loop forever.
+func TestAMalformedTokenIsRefusedRatherThanStored(t *testing.T) {
+	srv := apitest.New(t)
+	srv.Token = "odb_short"
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "bridge.json")
+	_, err := Run(context.Background(), Options{
+		ServerURL:  srv.URL(),
+		ConfigPath: cfgPath,
+		Code:       srv.Code,
+		Serial:     func() string { return "" },
+		Hostname:   func() (string, error) { return "box-01", nil },
+	})
+	if err == nil {
+		t.Fatal("a malformed token must be refused")
+	}
+	if !strings.Contains(err.Error(), "malformed") {
+		t.Fatalf("the error should name the fault: %v", err)
+	}
+	if strings.Contains(err.Error(), srv.Token) {
+		t.Fatalf("the error leaked the token: %v", err)
+	}
+	if _, statErr := os.Stat(cfgPath); !os.IsNotExist(statErr) {
+		t.Fatal("a token that cannot authenticate must not be written to disk")
+	}
+}
+
+func mustFailClaim(t *testing.T, srv *apitest.Server, code string) error {
+	t.Helper()
+	_, err := Claim(context.Background(), api.New(srv.URL(), ""), api.EnrollRequest{Code: code})
+	if err == nil {
+		t.Fatal("expected a failure")
+	}
+	return err
 }

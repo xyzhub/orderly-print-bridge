@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -16,7 +17,7 @@ const token = "odb_1234567890abcdef1234567890abcdef"
 // Counsel finding 4, enforced in the constructor rather than trusted to every
 // call site: once a byte has reached the printer, `retryable` cannot be set.
 func TestFailedCannotBeRetryableAfterAByteIsWritten(t *testing.T) {
-	got := Failed("prn_1", FailUnreachable, 1, true)
+	got := Failed("prn_1", FailOffline, "connection reset mid-stream", 1, true)
 	if got.Retryable {
 		t.Fatal("a failure after 1 byte written must not be retryable")
 	}
@@ -25,19 +26,62 @@ func TestFailedCannotBeRetryableAfterAByteIsWritten(t *testing.T) {
 	}
 
 	// With no reason supplied, a partial write names itself.
-	if r := Failed("prn_1", "", 99, true); r.FailureReason != FailPartial || r.Retryable {
+	if r := Failed("prn_1", "", "", 99, true); r.FailureReason != FailPartial || r.Retryable {
 		t.Fatalf("want a terminal failed{partial}, got %+v", r)
 	}
 
 	// A zero-byte failure keeps whatever the caller decided.
-	if r := Failed("prn_1", FailUnreachable, 0, true); !r.Retryable {
+	if r := Failed("prn_1", FailOffline, "", 0, true); !r.Retryable {
 		t.Fatal("a zero-byte failure may be retryable")
 	}
+}
 
-	// Both field spellings carry the same coarse code (package-doc ambiguity 1).
-	r := Failed("prn_1", FailRenderFailed, 0, false)
-	if r.FailureReason != r.Error || r.FailureReason != FailRenderFailed {
-		t.Fatalf("failureReason and error must agree: %+v", r)
+// The stored column has six values (PRINT_FAILURE_REASONS); anything else is
+// rewritten to `unknown` server-side, so the daemon must not invent a seventh.
+func TestFailureReasonIsCoercedIntoTheServersClosedSet(t *testing.T) {
+	if r := Failed("p", "unreachable", "raw", 0, true); r.FailureReason != FailUnknown {
+		t.Fatalf("a word outside the six must land on unknown, got %q", r.FailureReason)
+	}
+	for _, known := range FailureReasons {
+		if r := Failed("p", known, "raw", 0, false); r.FailureReason != known {
+			t.Errorf("%q was rewritten to %q", known, r.FailureReason)
+		}
+	}
+	// The raw driver string survives for a human.
+	if r := Failed("p", FailOffline, "dial tcp 10.0.0.5:9100: i/o timeout", 0, true); r.LastError == "" {
+		t.Fatal("lastError must carry the driver string")
+	}
+}
+
+// The deprecated `error` alias is gone: this build is the one that lets the
+// server drop it (ack.post.ts's one-release note).
+func TestAckNeverSendsTheDeprecatedErrorAlias(t *testing.T) {
+	for _, body := range []AckRequest{
+		Printed("p", 10),
+		Voided("p", "artifact_gone"),
+		Failed("p", FailPartial, "reset", 12, true),
+	} {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := m["error"]; ok {
+			t.Fatalf("the ack still sends the deprecated `error` key: %s", raw)
+		}
+	}
+}
+
+func TestVoidedAck(t *testing.T) {
+	got := Voided("prn_1", "artifact_gone: voided before it printed")
+	if got.Status != StatusVoided || got.FailureReason != "" || got.Retryable {
+		t.Fatalf("a voided ack carries no failure fields: %+v", got)
+	}
+	if got.LastError == "" {
+		t.Fatal("the human-readable detail should survive")
 	}
 }
 
@@ -46,7 +90,7 @@ func TestPrintedAck(t *testing.T) {
 	if got.Status != StatusPrinted || got.BytesWritten != 4096 || got.PrinterID != "prn_1" {
 		t.Fatalf("%+v", got)
 	}
-	if got.FailureReason != "" || got.Retryable {
+	if got.FailureReason != "" || got.LastError != "" || got.Retryable {
 		t.Fatalf("a success ack must carry no failure fields: %+v", got)
 	}
 }
@@ -58,7 +102,9 @@ func TestErrorStatusAndCodeParsing(t *testing.T) {
 		body     string
 		wantCode string
 	}{
-		{`{"statusCode":410,"statusMessage":"expired","data":{"code":"code_expired"}}`, "code_expired"},
+		// The merged shape: the machine code is in BOTH places.
+		{`{"statusCode":410,"statusMessage":"code_expired","data":{"error":"code_expired"}}`, "code_expired"},
+		{`{"statusCode":409,"statusMessage":"serial_conflict","data":{"error":"serial_conflict"}}`, "serial_conflict"},
 		{`{"statusCode":409,"code":"already_claimed","message":"taken"}`, "already_claimed"},
 		{`plain text failure`, ""},
 	}
@@ -81,6 +127,9 @@ func TestErrorStatusAndCodeParsing(t *testing.T) {
 		}
 		if apiErr.Code != tc.wantCode {
 			t.Errorf("code = %q, want %q", apiErr.Code, tc.wantCode)
+		}
+		if tc.wantCode != "" && !IsCode(err, tc.wantCode) {
+			t.Errorf("IsCode missed %q", tc.wantCode)
 		}
 		if !strings.Contains(apiErr.Error(), PathEnroll) {
 			t.Errorf("the error should name the route: %v", apiErr)

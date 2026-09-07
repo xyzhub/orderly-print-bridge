@@ -69,6 +69,17 @@ func IsStatus(err error, status int) bool {
 	return apiErr.Status == status
 }
 
+// IsCode reports whether err carries the given machine code. Needed because
+// 409 means two different things on enroll (`already_claimed` vs
+// `serial_conflict`) and something else again on the artifact (`lease_lost`).
+func IsCode(err error, code string) bool {
+	var apiErr *Error
+	if !asError(err, &apiErr) {
+		return false
+	}
+	return apiErr.Code == code
+}
+
 func asError(err error, target **Error) bool {
 	for err != nil {
 		if e, ok := err.(*Error); ok {
@@ -97,6 +108,13 @@ func (c *Client) Enroll(ctx context.Context, req EnrollRequest) (*EnrollResponse
 	}
 	if out.Token == "" {
 		return nil, fmt.Errorf("%s: server returned no device token", PathEnroll)
+	}
+	// device-token.ts mints `odb_` + 43 base64url chars. A token that does not
+	// match never authenticates, so failing here names the real fault (a proxy
+	// that rewrote the body, a wrong host) instead of an endless 401 loop.
+	if !DeviceTokenPattern.MatchString(out.Token) {
+		return nil, fmt.Errorf("%s: server returned a malformed device token (%d chars); refusing to store it",
+			PathEnroll, len(out.Token))
 	}
 	return &out, nil
 }
@@ -211,16 +229,20 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any, aut
 	return nil
 }
 
-// errorBody is the tolerant read of an H3 error payload. Nitro sends
-// {statusCode, statusMessage, message, data}; some handlers put a machine code
-// in data.code, others at the top level. The HTTP status stays authoritative.
+// errorBody reads the h3 error payload the merged handlers throw:
+// `{statusCode, statusMessage, data:{error}}`, where the MACHINE CODE appears
+// in both `statusMessage` and `data.error` (enroll.post.ts, artifact.get.ts,
+// ack.post.ts all use exactly this shape). `data.code` / top-level `code` are
+// still read so a differently-shaped middleware error is not opaque.
 type errorBody struct {
 	StatusCode    int    `json:"statusCode"`
 	StatusMessage string `json:"statusMessage"`
 	Message       string `json:"message"`
 	Code          string `json:"code"`
 	Data          struct {
+		Error   string `json:"error"`
 		Code    string `json:"code"`
+		Reason  string `json:"reason"`
 		Message string `json:"message"`
 	} `json:"data"`
 }
@@ -230,7 +252,7 @@ func readAPIError(resp *http.Response, path string) error {
 	apiErr := &Error{Status: resp.StatusCode, Path: path}
 	var parsed errorBody
 	if json.Unmarshal(raw, &parsed) == nil {
-		apiErr.Code = firstNonEmpty(parsed.Data.Code, parsed.Code)
+		apiErr.Code = firstNonEmpty(parsed.Data.Error, parsed.Data.Code, parsed.StatusMessage, parsed.Code)
 		apiErr.Message = firstNonEmpty(parsed.Data.Message, parsed.StatusMessage, parsed.Message)
 	}
 	if apiErr.Message == "" {

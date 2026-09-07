@@ -3,44 +3,57 @@
 // reconciling the daemon against the merged Phase-1 handlers is a one-file
 // diff rather than an archaeology exercise.
 //
-// # Contract source
+// # Contract source — RECONCILED against the merged Phase-1 handlers
 //
-// Phase 1 (the Orderly server side) was NOT merged when this package was
-// written, so these types are built to the WRITTEN CONTRACT, not to shipped
-// handlers. When Phase 1 lands, diff this file against the handlers under
-// `server/api/agent/v1/` in the Orderly repo and fix the drift here.
+// Reconciled 2026-09-07 against Orderly branch `mission/print-bridge-p1` at
+// 9b6d6de3. These types now mirror SHIPPED handlers, not a written sketch:
 //
-// The contract is, in the Orderly repo:
+//   - server/api/agent/v1/enroll.post.ts          + server/utils/print/enrollment.ts
+//   - server/api/agent/v1/heartbeat.post.ts       + server/utils/print/heartbeat.ts
+//   - server/api/agent/v1/jobs/poll.post.ts       + server/utils/print/poll.ts
+//   - server/api/agent/v1/jobs/[id]/ack.post.ts   + server/utils/print/ack.ts
+//   - server/api/agent/v1/jobs/[id]/artifact.get.ts
+//   - server/utils/print/device-token.ts          (the `odb_` token shape)
+//   - server/utils/db/queries/print.ts            (PRINT_FAILURE_REASONS)
 //
-//   - docs/product/decisions/2026-09-07-print-bridge-memos.md — the
-//     "Endpoints (auth per route)" table and the schema sketch above it
-//     (PrintDevice / DevicePrinter / PrinterRole / PrintJob field names).
-//   - .plans/print-bridge.sessions.md — brief S3 (enrollment by serial +
-//     setup code; `410 code_expired` distinct from `409 already_claimed`;
-//     token `odb_…` bearer) and brief S4 (poll / artifact / ack shapes and
-//     the `retryable` semantics).
-//   - docs/product/decisions/2026-09-07-print-bridge-counsel.md — finding 4
-//     (any byte written ⇒ terminal `failed{partial}`, never a re-queue),
-//     finding 6 (never blind-print to "first printer found"), finding 9
-//     (`expired` must not be reported as `conflict`).
+// The design reasons behind the shapes remain: memo 4 + the endpoint table in
+// docs/product/decisions/2026-09-07-print-bridge-memos.md, and counsel
+// findings 4 (any byte written ⇒ terminal `failed{partial}`), 6 (never
+// blind-print) and 9 (`expired` is not a `conflict`).
 //
-// # Ambiguities resolved here (name them when reconciling)
+// # What the reconciliation changed
 //
-//  1. The ack body is `{status, failureReason?, retryable?, bytesWritten?}`.
-//     Memo 4's table writes the failure field as `error`; the S4 brief calls
-//     it a "coarse failureReason list". The bridge sends BOTH keys with the
-//     same coarse code so either server field name binds; drop the loser once
-//     the merged handler is readable.
-//  2. `job.dots` (memo) is the width the ARTIFACT is rendered at;
-//     `printer.widthDots` is the physical head. The render_failed check
-//     compares the decoded PNG against `printer.widthDots`, because that is
-//     the number that decides whether paper is wasted.
-//  3. Error bodies are read tolerantly (H3 emits
-//     `{statusCode, statusMessage, data}`), but the HTTP STATUS is the
-//     authoritative discriminator: 410 = code_expired, 409 = already_claimed.
+//  1. The ack sends `{failureReason, lastError}`. The pre-merge build also
+//     sent `error`; the server accepts it only as a deprecated one-release
+//     alias of `lastError`, so it is GONE from this build. `failureReason`
+//     must be one of the server's six coarse tokens (anything else is stored
+//     as `unknown`); the daemon's richer word survives in `lastError`.
+//  2. `retryable` and `bytesWritten` are ADVISORY. `ack.ts` re-derives the
+//     partial-write decision from `bytesWritten` itself rather than trusting
+//     a flag from a daemon build it does not control — the daemon still sets
+//     them honestly, but the server is the authority.
+//  3. Error bodies are h3's `{statusCode, statusMessage, data:{error}}` and
+//     the MACHINE CODE is in both `statusMessage` and `data.error`. HTTP
+//     status stays the primary discriminator, but 409 carries TWO codes
+//     (`already_claimed` and `serial_conflict`), so the code is read too.
+//  4. A 410 on the artifact is acked `voided`, not `failed` — the handler's
+//     own comment names that as the expected daemon behaviour, and the job is
+//     already terminal server-side.
+//  5. `PollResponse.job.printer` is non-null whenever a job is returned
+//     (`poll.ts` claims only when the role's printer belongs to this device).
+//     The welcome/test candidate gate stays as defence, not as a normal path.
+//
+// # Still open
+//
+//   - `welcome` / `test` artifacts currently answer 501
+//     `kind_not_renderable_yet` until S5's slip routes merge; the daemon
+//     treats their PNGs like any other once they land.
 package api
 
-import "time"
+import (
+	"regexp"
+	"time"
+)
 
 // Paths on the Orderly server. Kept together so a route rename is one edit.
 const (
@@ -67,29 +80,55 @@ const (
 	StatusVoided  = "voided"
 )
 
-// Coarse failure reasons. The server stores these verbatim in
-// `PrintJob.lastError`; the manager surface maps them to human words (S5's
-// vocabulary constant), so this list stays short and stable.
+// FailureReasons are the SIX coarse tokens the server stores in
+// `PrintJob.failureReason` (`PRINT_FAILURE_REASONS` in
+// server/utils/db/queries/print.ts). They are the only strings the manager
+// surface maps to human words, so a seventh would render as itself; `ack.ts`
+// silently rewrites anything else to `unknown`. The daemon's own richer word
+// travels in `lastError`, where a human reads it.
 const (
 	// FailPartial — bytes reached the printer before the write failed.
 	// TERMINAL by contract (counsel finding 4): never retryable, because a
 	// retry after a partial write is how a venue gets two legal invoices.
+	// The server re-derives this from bytesWritten regardless of what we send.
 	FailPartial = "partial"
-	// FailRenderFailed — the artifact was unusable at this printer's width.
-	// Never resample: a silently rescaled receipt is a quality regression the
-	// venue only discovers on paper.
+	// FailRenderFailed — the artifact was unusable at this printer's width,
+	// or the render app could not produce it. Never resample.
 	FailRenderFailed = "render_failed"
-	// FailUnreachable — zero bytes written; the printer never answered.
-	// The only class the bridge marks retryable.
-	FailUnreachable = "unreachable"
+	// FailOffline — zero bytes written; the printer never answered, refused
+	// the connection, or is out of paper. The only class the bridge marks
+	// retryable. (The pre-merge build called this `unreachable`, which the
+	// server aliases here; we now send the stored token directly.)
+	FailOffline = "offline"
 	// FailTimeout — the job did not finish inside the 60 s ack window. Bytes
 	// written is unknown, so this is terminal, not retryable.
 	FailTimeout = "timeout"
 	// FailNoPrinter — no printer is assigned, or (for a welcome slip) no
 	// candidate could be identified safely. Terminal; the manager re-enqueues.
 	FailNoPrinter = "no_printer"
-	// FailArtifactGone — the artifact returned 410 (voided or expired).
-	FailArtifactGone = "artifact_gone"
+	// FailUnknown — the catch-all. `artifact_gone` used to be sent here; a
+	// 410 is now acked as `voided` instead (see the package doc, item 4).
+	FailUnknown = "unknown"
+)
+
+// FailureReasons is the closed set the server stores. Anything outside it is
+// rewritten to FailUnknown server-side.
+var FailureReasons = []string{FailTimeout, FailOffline, FailPartial, FailNoPrinter, FailRenderFailed, FailUnknown}
+
+// Machine codes carried in `statusMessage` and `data.error`. The HTTP status
+// is the primary discriminator; these split the two 409s and name the rest.
+const (
+	CodeInvalidCode    = "invalid_code"            // 400
+	CodeUnknownCode    = "unknown_code"            // 404
+	CodeCodeExpired    = "code_expired"            // 410
+	CodeAlreadyClaimed = "already_claimed"         // 409
+	CodeSerialConflict = "serial_conflict"         // 409
+	CodeDeviceRevoked  = "device_revoked"          // 403
+	CodeJobNotOwned    = "job_not_owned"           // 403 on ack/artifact
+	CodeLeaseLost      = "lease_lost"              // 409 on artifact — re-queued
+	CodeArtifactGone   = "artifact_gone"           // 410 on artifact
+	CodeNotRenderable  = "kind_not_renderable_yet" // 501 on artifact (S5 seam)
+	CodeRenderFailed   = "render_failed"           // 502 on artifact
 )
 
 // Transport values on DevicePrinter.transport.
@@ -113,6 +152,12 @@ type EnrollRequest struct {
 	Serial   string `json:"serial,omitempty"`
 	Version  string `json:"version,omitempty"`
 }
+
+// DeviceTokenPattern mirrors server/utils/print/device-token.ts: `odb_` plus
+// the base64url of 32 random bytes (43 characters). Validating it on receipt
+// turns a proxy that rewrote the body into an immediate, named failure rather
+// than a device that 401s forever.
+var DeviceTokenPattern = regexp.MustCompile(`^odb_[A-Za-z0-9_-]{43}$`)
 
 // EnrollResponse is returned exactly once per code (first-claim-wins CAS).
 type EnrollResponse struct {
@@ -221,14 +266,18 @@ type Job struct {
 
 // AckRequest reports the terminal outcome.
 //
+// FailureReason is one of the six coarse tokens above; LastError is the raw
+// driver string a human reads (truncated to 300 chars server-side). The
+// deprecated `error` alias is deliberately NOT sent — this build is the one
+// that lets the server drop it.
+//
 // Retryable is honoured by the server ONLY for zero-byte failures; the daemon
-// therefore never sets it true once BytesWritten > 0 (counsel finding 4). Both
-// FailureReason and Error carry the same coarse code — see ambiguity 1 in the
-// package doc.
+// never sets it true once BytesWritten > 0 (counsel finding 4), and `ack.ts`
+// re-derives the same decision independently.
 type AckRequest struct {
 	Status        string `json:"status"`
 	FailureReason string `json:"failureReason,omitempty"`
-	Error         string `json:"error,omitempty"`
+	LastError     string `json:"lastError,omitempty"`
 	Retryable     bool   `json:"retryable,omitempty"`
 	BytesWritten  int    `json:"bytesWritten,omitempty"`
 	PrinterID     string `json:"printerId,omitempty"`
@@ -246,9 +295,18 @@ func Printed(printerID string, bytesWritten int) AckRequest {
 	return AckRequest{Status: StatusPrinted, PrinterID: printerID, BytesWritten: bytesWritten}
 }
 
+// Voided builds the ack for a job the server has already terminated — the 410
+// on the artifact (voided by a browser print, or expired). The handler's own
+// comment names `voided` as the expected daemon answer.
+func Voided(printerID, detail string) AckRequest {
+	return AckRequest{Status: StatusVoided, PrinterID: printerID, LastError: detail}
+}
+
 // Failed builds a failure ack. It enforces counsel finding 4 in code, not in a
-// comment: retryable can never survive a byte reaching the printer.
-func Failed(printerID, reason string, bytesWritten int, retryable bool) AckRequest {
+// comment: retryable can never survive a byte reaching the printer. `detail`
+// is the raw driver string for a human; `reason` is coerced into the server's
+// closed token set so nothing silently lands on `unknown`.
+func Failed(printerID, reason, detail string, bytesWritten int, retryable bool) AckRequest {
 	if bytesWritten > 0 {
 		retryable = false
 		if reason == "" {
@@ -257,10 +315,20 @@ func Failed(printerID, reason string, bytesWritten int, retryable bool) AckReque
 	}
 	return AckRequest{
 		Status:        StatusFailed,
-		FailureReason: reason,
-		Error:         reason,
+		FailureReason: coarse(reason),
+		LastError:     detail,
 		Retryable:     retryable,
 		BytesWritten:  bytesWritten,
 		PrinterID:     printerID,
 	}
+}
+
+// coarse keeps the daemon inside the server's stored vocabulary.
+func coarse(reason string) string {
+	for _, known := range FailureReasons {
+		if reason == known {
+			return reason
+		}
+	}
+	return FailUnknown
 }

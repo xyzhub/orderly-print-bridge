@@ -236,12 +236,17 @@ func samePrinters(a, bb []api.Printer) bool {
 
 // jobOutcome is what one attempt produced.
 type jobOutcome struct {
-	printed   bool
+	printed bool
+	// voided means the server already terminated the job (artifact 410): ack
+	// `voided`, which artifact.get.ts names as the expected daemon answer.
+	voided    bool
 	bytes     int
 	reason    string
+	detail    string
 	retryable bool
-	// noAck means: say nothing and let the server's 2-minute lease reclaim
-	// re-queue the job. Used when we could not even fetch the artifact.
+	// noAck means: say nothing and let the server re-queue or reclaim. Used
+	// when the lease was lost (409) or the artifact could not be fetched at
+	// all — acking a job we do not hold is noise at best.
 	noAck bool
 	err   error
 }
@@ -250,7 +255,7 @@ func (b *Bridge) handle(ctx context.Context, job *api.Job) error {
 	printer, reason := b.selectPrinter(job)
 	if printer == nil {
 		b.logf("job %s (%s): %s — nothing printed", job.ID, job.Kind, reason)
-		return b.ack(ctx, job, api.Failed("", api.FailNoPrinter, 0, false))
+		return b.ack(ctx, job, api.Failed("", api.FailNoPrinter, reason, 0, false))
 	}
 
 	// One 60 s budget for artifact + raster + write, so a wedged printer can
@@ -271,27 +276,50 @@ func (b *Bridge) handle(ctx context.Context, job *api.Job) error {
 		// Bytes written is unknown, so this is terminal, not retryable —
 		// the honest reading of "we do not know whether paper moved".
 		b.logf("job %s (%s): did not finish within %s; acking failed{timeout}", job.ID, job.Kind, b.AckTimeout)
-		return b.ack(ctx, job, api.Failed(printer.ID, api.FailTimeout, 0, false))
+		return b.ack(ctx, job, api.Failed(printer.ID, api.FailTimeout,
+			fmt.Sprintf("no result within the %s ack window; bytes written unknown", b.AckTimeout), 0, false))
 	}
 }
 
 func (b *Bridge) execute(ctx context.Context, job *api.Job, printer api.Printer) jobOutcome {
 	artifact, err := b.Client.Artifact(ctx, job.ID)
 	if err != nil {
-		if api.IsStatus(err, http.StatusGone) {
-			return jobOutcome{reason: api.FailArtifactGone, err: err}
-		}
-		if api.IsStatus(err, http.StatusUnauthorized) || api.IsStatus(err, http.StatusForbidden) {
+		switch {
+		case api.IsStatus(err, http.StatusGone):
+			// Voided (the cashier printed in the browser) or expired. Already
+			// terminal server-side; ack `voided` and print nothing.
+			return jobOutcome{voided: true, detail: "artifact_gone: the job was voided or expired before it printed", err: err}
+		case api.IsStatus(err, http.StatusConflict):
+			// lease_lost: the server reclaimed this lease and RE-QUEUED the
+			// job. Abandon it silently — acking would fight the re-queue, and
+			// the next poll picks it up properly.
+			return jobOutcome{noAck: true, err: err}
+		case api.IsStatus(err, http.StatusNotImplemented):
+			// kind_not_renderable_yet — the S5 slip-route seam. Terminal:
+			// waiting will not make the server grow a renderer.
+			return jobOutcome{reason: api.FailRenderFailed,
+				detail: "the server cannot render this job kind yet (kind_not_renderable_yet)", err: err}
+		case api.IsStatus(err, http.StatusBadGateway):
+			// The render app failed. Zero bytes reached paper, so a retry is
+			// both safe and likely to work.
+			return jobOutcome{reason: api.FailRenderFailed, retryable: true,
+				detail: "the render service could not produce the receipt", err: err}
+		case api.IsStatus(err, http.StatusUnauthorized):
 			return jobOutcome{noAck: true, err: b.classify(err)}
+		case api.IsStatus(err, http.StatusForbidden):
+			// job_not_owned — not ours, or gone. The ack would 403 too.
+			return jobOutcome{noAck: true, err: err}
+		default:
+			// A transient fetch failure: stay silent and let the lease reclaim it.
+			return jobOutcome{noAck: true, err: err}
 		}
-		// A transient fetch failure: stay silent and let the lease reclaim it.
-		return jobOutcome{noAck: true, err: err}
 	}
 
 	img, _, err := image.Decode(bytes.NewReader(artifact))
 	if err != nil {
 		return jobOutcome{reason: api.FailRenderFailed,
-			err: fmt.Errorf("artifact is not a decodable image: %w", err)}
+			detail: "the artifact was not a decodable image",
+			err:    fmt.Errorf("artifact is not a decodable image: %w", err)}
 	}
 
 	// The width gate. This is checked BEFORE encoding as well as inside
@@ -300,10 +328,12 @@ func (b *Bridge) execute(ctx context.Context, job *api.Job, printer api.Printer)
 	got := img.Bounds().Dx()
 	if printer.WidthDots <= 0 {
 		return jobOutcome{reason: api.FailRenderFailed,
-			err: fmt.Errorf("printer %s has no paper width configured", printer.Name)}
+			detail: "this printer has no paper width configured",
+			err:    fmt.Errorf("printer %s has no paper width configured", printer.Name)}
 	}
 	if got != printer.WidthDots {
-		return jobOutcome{reason: api.FailRenderFailed,
+		detail := fmt.Sprintf("artifact is %d dots wide but this printer prints %d; refusing to resample", got, printer.WidthDots)
+		return jobOutcome{reason: api.FailRenderFailed, detail: detail,
 			err: fmt.Errorf("artifact is %d dots wide but %s prints %d dots; refusing to resample",
 				got, printer.Name, printer.WidthDots)}
 	}
@@ -316,16 +346,19 @@ func (b *Bridge) execute(ctx context.Context, job *api.Job, printer api.Printer)
 	}
 	stream, err := escpos.Encode(img, opts)
 	if err != nil {
-		return jobOutcome{reason: api.FailRenderFailed, err: err}
+		return jobOutcome{reason: api.FailRenderFailed, detail: err.Error(), err: err}
 	}
 
 	n, err := b.Send(printer.Target(), stream)
 	if err != nil {
 		if n > 0 {
-			// TERMINAL. Paper moved; a retry prints a second copy.
-			return jobOutcome{bytes: n, reason: api.FailPartial, retryable: false, err: err}
+			// TERMINAL. Paper moved; a retry prints a second copy. The server
+			// re-derives this from bytesWritten too (ack.ts rule 2).
+			return jobOutcome{bytes: n, reason: api.FailPartial, retryable: false,
+				detail: truncate(err.Error()), err: err}
 		}
-		return jobOutcome{bytes: 0, reason: api.FailUnreachable, retryable: true, err: err}
+		return jobOutcome{bytes: 0, reason: api.FailOffline, retryable: true,
+			detail: truncate(err.Error()), err: err}
 	}
 	return jobOutcome{printed: true, bytes: n}
 }
@@ -338,10 +371,13 @@ func (b *Bridge) report(ctx context.Context, job *api.Job, printer api.Printer, 
 	case out.printed:
 		b.logf("job %s (%s): printed %d bytes on %s", job.ID, job.Kind, out.bytes, printer.Name)
 		return b.ack(ctx, job, api.Printed(printer.ID, out.bytes))
+	case out.voided:
+		b.logf("job %s (%s): %v — acking voided, nothing printed", job.ID, job.Kind, out.err)
+		return b.ack(ctx, job, api.Voided(printer.ID, out.detail))
 	default:
 		b.logf("job %s (%s): failed{%s} after %d byte(s) on %s: %v",
 			job.ID, job.Kind, out.reason, out.bytes, printer.Name, out.err)
-		return b.ack(ctx, job, api.Failed(printer.ID, out.reason, out.bytes, out.retryable))
+		return b.ack(ctx, job, api.Failed(printer.ID, out.reason, out.detail, out.bytes, out.retryable))
 	}
 }
 
@@ -357,9 +393,13 @@ func (b *Bridge) ack(ctx context.Context, job *api.Job, body api.AckRequest) err
 }
 
 // selectPrinter decides where a job prints, and is where counsel finding 6
-// lives. A server-named printer is a deliberate assignment and is obeyed. Only
-// when the server named none — the welcome slip on a device with no role yet —
-// does the daemon choose, and then only from an unambiguous candidate.
+// lives. A server-named printer is a deliberate assignment and is obeyed.
+//
+// As merged, `poll.ts` claims a job ONLY when the role's printer belongs to
+// this device, so `job.printer` is non-null on every job the server hands out
+// and the branch below is defence rather than a normal path: it survives so a
+// future welcome/test slip issued before any role exists still cannot be
+// printed blind.
 func (b *Bridge) selectPrinter(job *api.Job) (*api.Printer, string) {
 	if job.Printer != nil && job.Printer.Address != "" {
 		p := *job.Printer
@@ -417,6 +457,16 @@ func selectWelcomeTarget(candidates []api.Printer, probe Prober, logf func(strin
 	}
 	return nil, fmt.Sprintf("%d printers answered the identity query; "+
 		"assign the receipt role in Orderly to say which one", len(identified))
+}
+
+// truncate keeps a driver string inside the server's 300-char `lastError`
+// budget so nothing is silently cut mid-word on the manager surface.
+func truncate(s string) string {
+	const max = 280
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
 }
 
 func thresholdOrDefault(v int) uint8 {

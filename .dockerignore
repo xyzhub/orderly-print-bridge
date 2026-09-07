@@ -1,0 +1,9 @@
+# Everything the build does not need. `sample/` alone is ~1MB of PNGs, and the
+# Dockerfile's test step needs them — so it stays.
+.git
+.github
+bin/
+dist/
+*.escpos
+.DS_Store
+README.md
