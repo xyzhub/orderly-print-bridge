@@ -1,11 +1,29 @@
-# Builds and publishes the box container on a `v*` tag.
+# Publishes the Linux binaries for a `v*` tag and CREATES the GitHub Release
+# that carries them.
 #
-# The box image's first-boot unit pulls ghcr.io/xyzhub/orderly-print-bridge:v1,
-# so a tag of `v1.0.0` must produce BOTH `v1.0.0` and the moving `v1` — the
-# major tag is what a flashed box follows for a fix without being re-flashed.
+# `install.sh` (Orderly, S13) fetches exactly these asset names from
+# https://github.com/xyzhub/orderly-print-bridge/releases/download/<tag>/<name>,
+# and so does `orderly-print-bridge self-update`. THE NAMES ARE A CROSS-REPO
+# CONTRACT (P-12): renaming one here is a 404 there that reads like a network
+# failure on a client's counter.
 #
-# The tag is created by a human, never by this workflow: shipping a new image
+#   orderly-print-bridge-linux-amd64
+#   orderly-print-bridge-linux-arm64
+#   orderly-print-bridge_<tag>_linux_amd64.tar.gz
+#   orderly-print-bridge_<tag>_linux_arm64.tar.gz
+#   SHA256SUMS                       (covers all four)
+#
+# The bare binaries are what the installer and the self-updater use — an
+# installer that has to untar is an installer with one more way to fail. The
+# tarballs ship beside them for anyone who wants the README with the binary.
+#
+# The tag is created by a human, never by this workflow: shipping a new binary
 # to every client's counter is a decision, not a side effect of a merge.
+#
+# There is NO container image job (LD-33). The v1.0.0 package stays published —
+# the LXC's rollback is `systemctl start orderly-bridge` on the cached image —
+# but the install path is now the binary + systemd unit, and building an image
+# nothing installs is a build that only rots.
 name: release
 
 on:
@@ -14,16 +32,12 @@ on:
       - 'v*'
 
 permissions:
-  contents: read
-  packages: write
-
-env:
-  IMAGE: ghcr.io/${{ github.repository }}
+  contents: write # the release job CREATES the release and uploads its assets
 
 jobs:
-  # The gate runs ONCE, natively, before anything is published. The Dockerfile
-  # also runs the suite, but only for the native arch — this job is what makes
-  # a green tag mean the same thing for arm64 (the t640 and the Pi) as for amd64.
+  # The gate runs ONCE, natively, before anything is published. This job is what
+  # makes a green tag mean the same thing for arm64 (the t640 and the Pi) as for
+  # amd64.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -42,47 +56,94 @@ jobs:
             echo "ok $target"
           done
 
-  image:
+  binaries:
     needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
+      - uses: actions/setup-go@v5
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          go-version: '1.26'
+          cache: false
 
-      - id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE }}
-          tags: |
-            type=ref,event=tag
-            type=semver,pattern=v{{major}}.{{minor}}
-            type=semver,pattern=v{{major}}
+      # CGO_ENABLED=0 so one binary runs on Debian, Alpine and a Pi without a
+      # matching libc; -trimpath so the build is reproducible and no builder
+      # path is baked in; -X stamps the tag into the version the daemon reports
+      # on every heartbeat and compares against when self-updating.
+      - name: build linux/amd64 + linux/arm64
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          VERSION="${TAG#v}"
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build \
+              -trimpath \
+              -ldflags "-s -w -X github.com/xyz/orderly-print-bridge/internal/version.Version=${VERSION}" \
+              -o "dist/orderly-print-bridge-linux-${arch}" .
+          done
 
-      # linux/amd64 + linux/arm64: the HP t640 is amd64, but an arm64 box (a Pi
-      # standing in for a t640 that cannot be sourced) must not need a rebuild.
-      # Cross-compiled by Go inside the build stage, so no QEMU.
-      - uses: docker/build-push-action@v6
+      - name: verify the stamped version
+        run: |
+          set -euo pipefail
+          # amd64 runs natively on the runner: a binary that reports the wrong
+          # version is a binary whose -X silently missed (a const, a renamed
+          # package), and that is invisible until a venue reports the wrong
+          # build months later.
+          got="$(./dist/orderly-print-bridge-linux-amd64 version)"
+          echo "$got"
+          case "$got" in
+            *"${GITHUB_REF_NAME#v}") echo "version stamp ok" ;;
+            *) echo "::error::binary reports '$got', expected the tag ${GITHUB_REF_NAME}"; exit 1 ;;
+          esac
+
+      - name: package the tarballs
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cp README.md dist/README.md
+          cd dist
+          for arch in amd64 arm64; do
+            cp "orderly-print-bridge-linux-${arch}" orderly-print-bridge
+            tar -czf "orderly-print-bridge_${TAG}_linux_${arch}.tar.gz" orderly-print-bridge README.md
+            rm orderly-print-bridge
+          done
+          rm README.md
+
+      # ONE SHA256SUMS over every asset — it is what `self-update` verifies
+      # against before it renames a downloaded binary into place, and what a
+      # stranger runs `sha256sum -c` on.
+      - name: checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum orderly-print-bridge-linux-* orderly-print-bridge_*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: create the release and upload the assets
+        uses: softprops/action-gh-release@v2
         with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            VERSION=${{ github.ref_name }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # No release exists for a tag until this runs — v1.0.0 has none, which
+          # is why install.sh could not have fetched anything.
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/orderly-print-bridge-linux-amd64
+            dist/orderly-print-bridge-linux-arm64
+            dist/orderly-print-bridge_*_linux_amd64.tar.gz
+            dist/orderly-print-bridge_*_linux_arm64.tar.gz
+            dist/SHA256SUMS
 
       - name: what shipped
         run: |
-          echo "### Published" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Published ${GITHUB_REF_NAME}"
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+            echo "Install: \`curl -fsSL https://<your-orderly>/install.sh | sudo bash -s -- --code ABCDEFGHJK\`"
+          } >> "$GITHUB_STEP_SUMMARY"
