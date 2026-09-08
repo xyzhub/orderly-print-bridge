@@ -65,7 +65,7 @@ func run() error {
 		case "enroll":
 			return runEnroll(args[1:])
 		case "version":
-			fmt.Println(version.UserAgent)
+			fmt.Println(version.UserAgent())
 			return nil
 		case "print":
 			return runPrint(args[1:])

@@ -195,7 +195,7 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body any, 
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("Accept", "application/json, image/png")
-	req.Header.Set("User-Agent", version.UserAgent)
+	req.Header.Set("User-Agent", version.UserAgent())
 	if auth {
 		if c.Token.IsZero() {
 			return nil, fmt.Errorf("%s: no device token (not enrolled)", path)
