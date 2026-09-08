@@ -34,10 +34,74 @@ The binary now has **two shapes**:
 | Print engine (the original) | `--image … --printer …` | one-shot: rasterise an image and send it |
 | **Daemon** | `serve` | enroll, then poll Orderly for print jobs, print, acknowledge |
 
-**Deferred to Phase 4 (NOT built here):** printer discovery (the port-9100 /
-mDNS / USB sweep — v1 takes a printer address configured on the server), the
-PC download path with the claim code in the filename, signed installers and a
-self-updater, the Star dialect, Windows USB, and the cash-drawer kick.
+**Built in Phase 4 (this release):** a bounded printer discovery sweep
+(`discover`), a checksum-verified `self-update`, the tailnet join from the
+enrolment response, a per-printer left margin, and released Linux binaries.
+
+**Still deferred:** mDNS discovery (LD-32 — the `:9100` + `GS I` probe is
+enough for v1.1), signed Windows/macOS installers, the Star dialect, Windows USB
+via the spooler, and the cash-drawer kick.
+
+---
+
+## Install (Linux box or PC)
+
+One line, from the venue's own Orderly server, which also carries the setup
+code:
+
+```bash
+curl -fsSL https://<your-orderly>/install.sh | sudo bash -s -- --code ABCDEFGHJK
+```
+
+That installs the binary to `/usr/local/bin/orderly-print-bridge`, writes the
+`orderly-bridge.service` unit and the nightly `orderly-bridge-update.timer`, and
+enrols the device. (The installer route ships with Orderly S13; the assets it
+fetches are published by this repo's `release.yml`.)
+
+By hand, from the release:
+
+```bash
+TAG=v1.1.0
+ARCH=amd64                                   # or arm64
+BASE=https://github.com/xyzhub/orderly-print-bridge/releases/download/$TAG
+curl -fsSLO $BASE/orderly-print-bridge-linux-$ARCH
+curl -fsSLO $BASE/SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS     # MUST print: OK
+sudo install -m 0755 orderly-print-bridge-linux-$ARCH /usr/local/bin/orderly-print-bridge
+```
+
+### Keeping it up to date
+
+```bash
+orderly-print-bridge self-update --check   # is there a newer v1?
+orderly-print-bridge self-update           # verify the digest, install, restart
+```
+
+`self-update` reads the public release feed, **refuses anything outside the v1
+major line** (a v2 is a decision, not a download), fetches the asset and the
+release's `SHA256SUMS`, verifies the digest, and only then renames the new
+binary into place. A digest that does not match aborts and keeps the running
+binary. Offline, or GitHub rate-limiting the venue's IP, is a logged skip and
+exit 0 — never a failed unit.
+
+The install path of record is the nightly timer `install.sh` writes:
+
+```ini
+# /etc/systemd/system/orderly-bridge-update.timer
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=3h
+Persistent=true
+```
+
+`serve` also checks every 24 h (± 10% jitter) and, by default, only *reports*
+that an update exists in the journal. `serve --auto-update` makes it install and
+restart, for installs with no timer.
+
+> **Docker is deprecated.** The `v1.0.0` image stays published as a rollback
+> (`systemctl start orderly-bridge` on the box's cached image), but `v1.1.0`
+> publishes **no new image** (LD-33): the install path is a binary plus a
+> systemd unit.
 
 ---
 
@@ -105,11 +169,20 @@ nmap -p 9100 --open 192.168.1.0/24
 
 ### 2. Print to a USB printer
 
-Plug the printer in; the OS exposes it as a raw character device.
+Plug the printer in; Linux exposes a printer-class device as `/dev/usb/lp0`
+(the `usblp` driver). All three spellings reach the same code path —
+`usb:/dev/usb/lp0` (what `discover` reports and what you paste into Orderly),
+`usb:///dev/usb/lp0`, and the bare `/dev/usb/lp0` an older printer row carries.
+
+The device node is **never created**: a `usb:` target that is missing means the
+printer is unplugged or off, and creating a file at `/dev/usb/lp0` would swallow
+every receipt in silence. The open is bounded at 8 s (a powered-off usblp node
+blocks in the kernel forever otherwise) and the write at 30 s, and a permission
+error names its fix — the `lp` group.
 
 ```bash
 # Linux — usually /dev/usb/lp0 (add yourself to the 'lp' group, or use sudo)
-./bin/orderly-print-bridge --image sample/receipt.png --printer usb:///dev/usb/lp0
+./bin/orderly-print-bridge --image sample/receipt.png --printer usb:/dev/usb/lp0
 
 # macOS/BSD — the device shows up under /dev/ (e.g. /dev/cu.usbmodem*)
 ./bin/orderly-print-bridge --image sample/receipt.png --printer usb:///dev/cu.usbmodemXXXX
@@ -165,6 +238,7 @@ open roundtrip.png
 | `--threshold <0-255>` | `128` | grey cutoff for black (only when not dithering) |
 | `--center` | off | center the image on the paper |
 | `--full-cut` | off | full cut (`GS V 0`) instead of partial cut (`GS V 66 0`) |
+| `--left-margin <n>` | `0` | shift the raster right by *n* dots inside the paper width (0–64) |
 | `--decode <path>` | — | decode an ESC/POS file back to a PNG (writes to `--out`) |
 
 ### Threshold vs. dither
@@ -248,6 +322,82 @@ the binary serves a setup page on `http://127.0.0.1:47831/` as a last resort.
   > build. It has not been tried on a bench. Do not assume it replies.
 - **Every job is acked within 60 s** or acked `failed{timeout}`.
 - **A 401 stops the loop** and reports "revoked".
+- **A discovered printer is never printed to.** The sweep below is a list a
+  human reads; routing comes only from the server's assignment.
+
+### Printer discovery
+
+```bash
+orderly-print-bridge discover          # what can this machine see?
+orderly-print-bridge discover --quiet  # addresses only, one per line
+
+systemctl kill -s USR1 orderly-bridge  # make the daemon sweep right now
+```
+
+The daemon sweeps at most **every 10 minutes** (and on `SIGUSR1`) and reports
+what it found on the next heartbeat, capped at 50 entries. It is bounded on
+every axis, because a discovery feature that saturates a venue's switch during
+service is worse than none: **this box's own /24 only** (a /16 is narrowed to
+the /24 around us), TCP **9100** only, 32 concurrent dials, a 300 ms dial
+timeout, and ~10 s for the whole sweep. Each responder is then asked the ESC/POS
+identity query `GS I 1` — 9100 is JetDirect, so an office LaserJet answers too,
+and silence is recorded as "not identified", never as "not a printer".
+
+**USB** (Linux only in this release): `/dev/usb/lp*` plus, where sysfs is
+readable, `idVendor` / `idProduct` / `manufacturer` / `product` from
+`/sys/class/usbmisc/lp<N>/device/..`, reported as
+`usb:/dev/usb/lp0 · EPSON TM-T20III · 04b8:0e15`. Inside a container with the
+node mapped but no `/sys`, the node is still reported — it is the part you can
+print to. Windows USB (via the spooler) stays deferred.
+
+**No mDNS** (LD-32): `_pdl-datastream._tcp` would add a resolver dependency and
+an open UDP port for a marginal gain over "who answers on 9100".
+
+### The left margin (`leftMarginDots`)
+
+A per-printer setting on the server (0 by default, capped at 64 dots ≈ 8 mm at
+203 dpi), and `--left-margin` on the one-shot CLI. It shifts the raster right
+**inside the paper width**: the first *n* dot-columns go white and the row moves
+right by *n*.
+
+It does **not** widen the raster, deliberately. The daemon refuses an artifact
+whose width is not the printer's `widthDots`, and a raster emitted wider than
+the head is the same complaint on the other edge — the firmware clips or wraps
+the overflow. The cost is stated rather than hidden: the rightmost *n* columns
+of the artifact are dropped (on a receipt that hugs the left edge, those are the
+blank right margin), and the daemon logs that on every job with a margin set.
+
+**`GS L` is not emitted.** It is a standard-mode command and no bench reading
+yet proves this head honours it in raster mode; an unverified command that does
+nothing on one model and shifts twice on another is worse than a shift you can
+see in `--decode`. Verify a margin without paper:
+
+```bash
+orderly-print-bridge --image sample/receipt.png --width 512 --left-margin 24 --out m.escpos
+orderly-print-bridge --decode m.escpos --out m.png   # still 512 wide, 24 blank columns
+```
+
+### The tailnet join
+
+If the enrolment response carries a `tailscale` block, the daemon runs
+`tailscale up --auth-key file:<path> --ssh --accept-dns=false --hostname <name>`
+once, **after** enrolment and never blocking it, the poll loop or a print. No
+block (every server before Orderly's S13), no `tailscale` binary, or a refused
+key are each one log line and a daemon that keeps printing.
+
+**Key hygiene** — the whole point of the design:
+
+- the key goes to `tailscale` through a **0600 file** that is overwritten and
+  removed afterwards, never on the command line: `/proc/<pid>/cmdline` is
+  world-readable, so an argv key is published to every process on the box;
+- it is a redacting type from the JSON decoder onward, so it cannot reach a log
+  line, an error string or an accidental `json.Marshal`;
+- it is **never written to `bridge.json`**;
+- `tailscale`'s own output and error are scrubbed before they are formatted
+  (`tailscale up` echoes its flags back on some failures).
+
+`--accept-dns=false` is deliberate: a box must not take DNS from the tailnet,
+because its printer lives on the venue's LAN.
 
 ## Samples
 
@@ -278,33 +428,52 @@ internal/bridge/              the poll → artifact → raster → print → ack
 internal/secret/              a token type that redacts through fmt and json
 internal/escpos/raster.go     image → GS v 0 ESC/POS (resize, 1-bit, banding)
 internal/escpos/decode.go     ESC/POS → image (round-trip verification)
-internal/transport/           tcp:// · usb:// · file:// delivery, byte counts, GS I
+internal/transport/           tcp:// · usb: · file:// delivery, byte counts, GS I
+internal/discover/            the bounded :9100 sweep + Linux USB node scan
+internal/tailnet/             `tailscale up` with a key that never touches argv
+internal/update/              checksum-verified self-update, pinned to v1
 sample/                       real Orderly receipt PNGs
 ```
 
-## Roadmap (Phase 4, after the client witness)
+## Roadmap (after v1.1)
 
-Printer discovery (port-9100 sweep + mDNS + USB), the PC download path with the
-claim code carried in the filename, signed Windows/macOS installers and a
-self-updater, the Star dialect, Windows USB via the spooler, and the
-cash-drawer kick (`ESC p`, carried by the job's `actions[]`).
+mDNS discovery, signed Windows/macOS installers, the Star dialect, Windows USB
+via the spooler, and the cash-drawer kick (`ESC p`, carried by the job's
+`actions[]`).
 
-## The box container
+## Releases
+
+`.github/workflows/release.yml` runs on a `v*` tag (created by a human —
+shipping to every client's counter is a decision, not a merge side effect). It
+gates on `go vet` + `go test` + a six-target cross-compile, then builds
+`linux/amd64` and `linux/arm64` (`CGO_ENABLED=0 -trimpath`, the tag stamped into
+`internal/version.Version`), writes one `SHA256SUMS`, and **creates the GitHub
+Release** with these assets:
+
+```
+orderly-print-bridge-linux-amd64            the installer + self-update asset
+orderly-print-bridge-linux-arm64
+orderly-print-bridge_<tag>_linux_amd64.tar.gz   binary + README
+orderly-print-bridge_<tag>_linux_arm64.tar.gz
+SHA256SUMS                                  covers all four
+```
+
+**The names are a contract with Orderly's `install.sh`** — renaming one is a 404
+on a client's counter that looks like a network failure.
+
+### The box container (deprecated)
 
 ```bash
 docker run -d --restart=unless-stopped \
   -v /etc/orderly:/etc/orderly \
   -v /sys/class/dmi/id:/sys/class/dmi/id:ro \
-  ghcr.io/xyzhub/orderly-print-bridge:v1 --server https://orderly.example
+  ghcr.io/xyzhub/orderly-print-bridge:v1.0.0 --server https://orderly.example
 ```
 
-`scratch` base, static binary, runs as root — the DMI serial is root-only in
-the kernel and the config file is 0600. Debugging is `docker logs` from the
-Debian host over Tailscale SSH; there is deliberately no shell in the image.
-`.github/workflows/release.yml` publishes `linux/amd64` + `linux/arm64` to GHCR
-on a `v*` tag (a human creates the tag — shipping to every client's counter is
-a decision, not a merge side effect). A `v1.0.0` tag also moves `:v1`, which is
-the tag a flashed box follows.
+`v1.0.0`'s image stays published as the rollback for the boxes already running
+it; **v1.1.0 publishes no image** (LD-33). Note that a container needs the USB
+device mapped in (`--device /dev/usb/lp0`) or a USB printer is invisible to it —
+that is what "no such file or directory" on the staging box was.
 
 ## Contract status
 
