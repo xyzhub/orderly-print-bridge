@@ -31,9 +31,11 @@ USAGE
   orderly-print-bridge --decode receipt.escpos --out roundtrip.png   (verify)
 
 COMMANDS
-  serve    run the daemon: enroll if needed, then poll Orderly for print jobs
-  enroll   claim a setup code and store the device token, then exit
-  version  print the agent version
+  serve        run the daemon: enroll if needed, then poll Orderly for print jobs
+  enroll       claim a setup code and store the device token, then exit
+  discover     sweep this machine's LAN + USB for printers and print the list
+  self-update  fetch, verify and install the latest v1 release (alias: update)
+  version      print the agent version
   (no command = the one-shot print/decode CLI below)
 
 FLAGS
@@ -45,6 +47,8 @@ FLAGS
   --dither            Floyd-Steinberg dither instead of a hard threshold
   --threshold <0-255> grey cutoff for black when not dithering (default 128)
   --center            center the image on the paper
+  --left-margin <n>   shift the raster right by n dots inside the paper width
+                      (0-64; the rightmost n dots of the image are dropped)
   --full-cut          full cut (GS V 0) instead of partial cut (GS V 66 0)
   --decode  <path>    decode an ESC/POS file back to PNG (writes to --out)
 `
@@ -86,15 +90,16 @@ func runPrint(args []string) error {
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 
 	var (
-		imagePath = fs.String("image", "", "receipt image (PNG/JPEG) to print")
-		printer   = fs.String("printer", "", "printer target (tcp://, usb://, file://)")
-		out       = fs.String("out", "", "dry-run output file for ESC/POS bytes (PNG in --decode mode)")
-		width     = fs.Int("width", 576, "raster width in dots")
-		dither    = fs.Bool("dither", false, "Floyd-Steinberg dither instead of threshold")
-		threshold = fs.Int("threshold", 128, "grey cutoff (0-255) for black when not dithering")
-		center    = fs.Bool("center", false, "center the image on the paper")
-		fullCut   = fs.Bool("full-cut", false, "full cut instead of partial cut")
-		decode    = fs.String("decode", "", "decode an ESC/POS file back to PNG (writes to --out)")
+		imagePath  = fs.String("image", "", "receipt image (PNG/JPEG) to print")
+		printer    = fs.String("printer", "", "printer target (tcp://, usb://, file://)")
+		out        = fs.String("out", "", "dry-run output file for ESC/POS bytes (PNG in --decode mode)")
+		width      = fs.Int("width", 576, "raster width in dots")
+		dither     = fs.Bool("dither", false, "Floyd-Steinberg dither instead of threshold")
+		threshold  = fs.Int("threshold", 128, "grey cutoff (0-255) for black when not dithering")
+		center     = fs.Bool("center", false, "center the image on the paper")
+		fullCut    = fs.Bool("full-cut", false, "full cut instead of partial cut")
+		decode     = fs.String("decode", "", "decode an ESC/POS file back to PNG (writes to --out)")
+		leftMargin = fs.Int("left-margin", 0, "shift the raster right by N dots inside the paper width (0-64)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -115,6 +120,9 @@ func runPrint(args []string) error {
 	if *threshold < 0 || *threshold > 255 {
 		return fmt.Errorf("--threshold must be 0-255, got %d", *threshold)
 	}
+	if *leftMargin < 0 || *leftMargin > escpos.MaxLeftMarginDots {
+		return fmt.Errorf("--left-margin must be 0-%d dots, got %d", escpos.MaxLeftMarginDots, *leftMargin)
+	}
 
 	img, err := loadImage(*imagePath)
 	if err != nil {
@@ -122,12 +130,13 @@ func runPrint(args []string) error {
 	}
 
 	opts := escpos.Options{
-		Width:      *width,
-		Dither:     *dither,
-		Threshold:  uint8(*threshold),
-		Center:     *center,
-		FullCut:    *fullCut,
-		BandHeight: 128,
+		Width:          *width,
+		Dither:         *dither,
+		Threshold:      uint8(*threshold),
+		Center:         *center,
+		FullCut:        *fullCut,
+		BandHeight:     128,
+		LeftMarginDots: *leftMargin,
 	}
 	stream, err := escpos.Encode(img, opts)
 	if err != nil {

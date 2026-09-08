@@ -62,7 +62,33 @@ type Options struct {
 	// multi-thousand-row command; banding keeps each command small. 0 selects
 	// the default (128).
 	BandHeight int
+	// LeftMarginDots shifts the image right by this many dots INSIDE Width —
+	// the first N columns of every row go white and the row's own content
+	// moves right by N. #1079: on a ~560-dot head a receipt rendered from
+	// column 0 hugs the paper's left edge.
+	//
+	// Why a shift inside Width and not a wider raster: Encode refuses a source
+	// whose width is not Width (NoResample, every daemon path), and a raster
+	// emitted WIDER than the head is #1079's failure on the other edge — the
+	// firmware either clips the overflow or wraps it onto the next line, which
+	// is how a receipt becomes unreadable rather than merely off-centre. The
+	// cost is honest and stated: the rightmost N dot-columns of the artifact
+	// are not printed. On the artifact this exists for, those columns are the
+	// blank right margin the complaint is about.
+	//
+	// GS L (set-left-margin) is NOT emitted. It is a standard-mode command and
+	// no bench reading yet proves this head honours it in raster mode; an
+	// unverified command that silently does nothing on one model and shifts
+	// twice on another is worse than a shift we can see in --decode. See the
+	// README.
+	//
+	// Bounded to [0, 64] and clamped below Width; 0 is byte-identical to the
+	// build before this field existed.
+	LeftMarginDots int
 }
+
+// MaxLeftMarginDots bounds Options.LeftMarginDots (~8mm at 203dpi).
+const MaxLeftMarginDots = 64
 
 // DefaultOptions returns sane defaults for an 80mm thermal receipt.
 func DefaultOptions() Options {
@@ -115,6 +141,10 @@ func Encode(src image.Image, opts Options) ([]byte, error) {
 	// 2. 1-bit conversion: dither OR threshold. mono[y*W+x] == true means black.
 	mono := to1bit(resized, opts.Dither, opts.Threshold)
 
+	// 2b. the left margin, applied to the 1-bit mask so the shifted-in columns
+	// are exactly white and no grey is invented at the seam.
+	shiftRight(mono, dstW, dstH, clampMargin(opts.LeftMarginDots, dstW))
+
 	// 3. emit the stream.
 	var buf bytes.Buffer
 	buf.Write(cmdInit)
@@ -162,6 +192,39 @@ func writeRasterCommand(buf *bytes.Buffer, mono []bool, width, bytesPerRow, y0, 
 				}
 			}
 			buf.WriteByte(b)
+		}
+	}
+}
+
+// clampMargin keeps a server-supplied margin inside [0, MaxLeftMarginDots] and
+// inside the paper. A margin at or past the width would print a blank receipt,
+// which is the one outcome worse than an off-centre one.
+func clampMargin(n, width int) int {
+	if n <= 0 {
+		return 0
+	}
+	if n > MaxLeftMarginDots {
+		n = MaxLeftMarginDots
+	}
+	if n >= width {
+		n = width - 1
+	}
+	return n
+}
+
+// shiftRight moves every row of the 1-bit mask right by n dots in place,
+// whitening the first n columns and dropping the n that fall off the right.
+// The mask stays exactly width*height, so the emitted raster is still exactly
+// Width dots wide — the property the printer's head cares about.
+func shiftRight(mono []bool, width, height, n int) {
+	if n <= 0 || n >= width {
+		return
+	}
+	for y := 0; y < height; y++ {
+		row := mono[y*width : (y+1)*width]
+		copy(row[n:], row[:width-n])
+		for x := 0; x < n; x++ {
+			row[x] = false
 		}
 	}
 }

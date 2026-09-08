@@ -339,10 +339,18 @@ func (b *Bridge) execute(ctx context.Context, job *api.Job, printer api.Printer)
 	}
 
 	opts := escpos.Options{
-		Width:      printer.WidthDots,
-		Threshold:  thresholdOrDefault(printer.Threshold),
-		BandHeight: bandOrDefault(printer.BandHeight),
-		NoResample: true,
+		Width:          printer.WidthDots,
+		Threshold:      thresholdOrDefault(printer.Threshold),
+		BandHeight:     bandOrDefault(printer.BandHeight),
+		NoResample:     true,
+		LeftMarginDots: printer.LeftMarginDots,
+	}
+	if printer.LeftMarginDots > 0 {
+		// Say it on every print, because it is a per-printer server setting a
+		// venue can change without telling anyone, and "the right edge is
+		// clipped" is otherwise an unexplainable paper symptom.
+		b.logf("job %s: left margin %d dots on %s (the artifact's rightmost %d columns are not printed)",
+			job.ID, printer.LeftMarginDots, printer.Name, printer.LeftMarginDots)
 	}
 	stream, err := escpos.Encode(img, opts)
 	if err != nil {

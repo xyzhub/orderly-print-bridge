@@ -2,6 +2,7 @@ package main
 
 import (
 	"image"
+	"image/color"
 	_ "image/png"
 	"os"
 	"path/filepath"
@@ -93,5 +94,40 @@ func TestCommandDispatch(t *testing.T) {
 	}
 	if _, err := os.Stat(sink); err != nil {
 		t.Fatalf("flag-first invocation wrote nothing: %v", err)
+	}
+}
+
+// The margin's own --decode round trip, at client #1's width: the repo's proof
+// of the byte stream is the decoder, so the paper claim ("a gap on the left")
+// is checked here without a printer. Task 49.
+func TestCLILeftMarginShiftsWithoutWidening(t *testing.T) {
+	sink := filepath.Join(t.TempDir(), "margin.escpos")
+	if err := runPrint([]string{
+		"--image", "sample/receipt.png", "--width", "512",
+		"--left-margin", "24", "--out", sink,
+	}); err != nil {
+		t.Fatalf("print with margin: %v", err)
+	}
+	raw, err := os.ReadFile(sink)
+	if err != nil {
+		t.Fatalf("read sink: %v", err)
+	}
+	img, err := escpos.Decode(raw)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got := img.Bounds().Dx(); got != 512 {
+		t.Fatalf("the margin widened the raster to %d dots; a raster wider than the head is #1079 on the other edge", got)
+	}
+	// Every one of the first 24 columns must be white on every row.
+	for y := img.Bounds().Min.Y; y < img.Bounds().Max.Y; y++ {
+		for x := 0; x < 24; x++ {
+			if color.GrayModel.Convert(img.At(x, y)).(color.Gray).Y < 128 {
+				t.Fatalf("ink at (%d,%d): the first 24 columns must be blank", x, y)
+			}
+		}
+	}
+	if err := runPrint([]string{"--image", "sample/receipt.png", "--left-margin", "999", "--out", sink}); err == nil {
+		t.Fatal("a margin past the cap must be refused, not silently clamped at the CLI")
 	}
 }
