@@ -14,6 +14,7 @@ import (
 	"github.com/xyz/orderly-print-bridge/internal/bridge"
 	"github.com/xyz/orderly-print-bridge/internal/config"
 	"github.com/xyz/orderly-print-bridge/internal/enroll"
+	"github.com/xyz/orderly-print-bridge/internal/tailnet"
 	"github.com/xyz/orderly-print-bridge/internal/version"
 )
 
@@ -72,7 +73,7 @@ func (c *commonFlags) path() string {
 	return config.DefaultPath()
 }
 
-func (c *commonFlags) enrollOptions(serverURL string) enroll.Options {
+func (c *commonFlags) enrollOptions(serverURL string, onTailnet func(tailnet.Join)) enroll.Options {
 	return enroll.Options{
 		ServerURL:      serverURL,
 		ConfigPath:     c.path(),
@@ -80,7 +81,31 @@ func (c *commonFlags) enrollOptions(serverURL string) enroll.Options {
 		Code:           c.code,
 		AllowLocalPage: !c.noLocalPage,
 		Logf:           logger.Printf,
+		OnTailnet:      onTailnet,
 	}
+}
+
+// joinTailnet runs `tailscale up` with the key the server minted. Every failure
+// is a warning: a box that cannot reach the tailnet must still print (LD-17),
+// and support reachability is not worth a daemon that refuses to start.
+func joinTailnet(ctx context.Context, join tailnet.Join) {
+	j := &tailnet.Joiner{Logf: logger.Printf}
+	if err := j.Up(ctx, join); err != nil {
+		if errors.Is(err, tailnet.ErrNoKey) || errors.Is(err, tailnet.ErrNotInstalled) {
+			// Already said its one line, at the right volume.
+			return
+		}
+		logger.Printf("tailnet join failed (printing is unaffected): %v", err)
+	}
+}
+
+// joinTailnetInBackground is what `serve` uses: enrolment is done, the poll
+// loop must start now, and `tailscale up` can take a minute on a cold uplink.
+// The context is detached deliberately — a join half-run because the parent
+// moved on is a worse state than one that finishes.
+func joinTailnetInBackground(ctx context.Context, join tailnet.Join) {
+	detached := context.WithoutCancel(ctx)
+	go joinTailnet(detached, join)
 }
 
 func runEnroll(args []string) error {
@@ -105,7 +130,11 @@ func runEnroll(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	_, err := enroll.Run(ctx, c.enrollOptions(serverURL))
+	// The one-shot `enroll` command joins SYNCHRONOUSLY: the process is about
+	// to exit, and a backgrounded join would be killed mid-flight.
+	_, err := enroll.Run(ctx, c.enrollOptions(serverURL, func(join tailnet.Join) {
+		joinTailnet(ctx, join)
+	}))
 	return err
 }
 
@@ -185,7 +214,9 @@ func loadOrEnroll(ctx context.Context, c *commonFlags) (*config.Config, error) {
 	// first boot, and a dead container is a box that never prints.
 	backoff := 5 * time.Second
 	for attempt := 1; ; attempt++ {
-		enrolled, err := enroll.Run(ctx, c.enrollOptions(serverURL))
+		enrolled, err := enroll.Run(ctx, c.enrollOptions(serverURL, func(join tailnet.Join) {
+			joinTailnetInBackground(ctx, join)
+		}))
 		if err == nil {
 			return enrolled, nil
 		}

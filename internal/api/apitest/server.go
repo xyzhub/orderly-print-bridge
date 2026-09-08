@@ -39,6 +39,10 @@ type Server struct {
 	SerialConflict bool // 409 serial_conflict (NOT already_claimed)
 	DeviceRevoked  bool // 403 device_revoked
 	claimed        bool
+	// Tailscale, when set, is returned in the enrol response — the S13 server
+	// half (master-plan task 48). nil is what every server before it answers,
+	// and the daemon must treat that as normal.
+	Tailscale *api.TailscaleJoin
 
 	// Heartbeat state.
 	printers []api.Printer
@@ -202,9 +206,21 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.claimed = true
-	writeJSON(w, http.StatusOK, api.EnrollResponse{
-		Token: s.Token, DeviceID: s.DeviceID, VenueID: s.VenueID, Name: "Front counter",
-	})
+	body := map[string]any{
+		"token": s.Token, "deviceId": s.DeviceID, "venueId": s.VenueID, "name": "Front counter",
+	}
+	if s.Tailscale != nil {
+		// Hand-built, because api.TailscaleJoin.AuthKey is a secret.Secret and
+		// MARSHALS as "[redacted]" by design — the real server is TypeScript, so
+		// only this fake ever needs to put a raw key on the wire.
+		body["tailscale"] = map[string]any{
+			"authKey":     s.Tailscale.AuthKey.Reveal(),
+			"hostname":    s.Tailscale.Hostname,
+			"tags":        s.Tailscale.Tags,
+			"loginServer": s.Tailscale.LoginServer,
+		}
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
