@@ -17,10 +17,12 @@ func blackImage(w, h int) *image.Gray {
 	return g
 }
 
-// The load-bearing property of the margin (master-plan task 49): the raster
-// stays EXACTLY Width dots wide — a wider one is #1079's failure on the other
-// edge — and the first N columns are white.
-func TestLeftMarginKeepsWidthAndWhitensFirstColumns(t *testing.T) {
+// The load-bearing property of the margin (owner ruling 2026-09-08, superseding
+// master-plan task 49): the raster is Width + margin wide, the first N columns
+// are white, and NO CONTENT IS DROPPED — the profile width is the content
+// width, so cropping it would take totals off a receipt with nothing on paper
+// to show for it.
+func TestLeftMarginWidensAndWhitensFirstColumns(t *testing.T) {
 	const (
 		width  = 512
 		height = 32
@@ -39,8 +41,8 @@ func TestLeftMarginKeepsWidthAndWhitensFirstColumns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if got := img.Bounds().Dx(); got != width {
-		t.Fatalf("margin widened the raster to %d dots; it must stay exactly %d", got, width)
+	if got := img.Bounds().Dx(); got != width+margin {
+		t.Fatalf("raster is %d dots wide, want %d (width + margin)", got, width+margin)
 	}
 	for x := 0; x < margin; x++ {
 		if isInk(img, x, 0) {
@@ -50,10 +52,14 @@ func TestLeftMarginKeepsWidthAndWhitensFirstColumns(t *testing.T) {
 	if !isInk(img, margin, 0) {
 		t.Fatalf("column %d is blank; the image should start exactly at the margin", margin)
 	}
-	// And the shift is a shift, not a crop-and-stretch: the last column is
-	// still ink because the source was ink all the way across.
-	if !isInk(img, width-1, height-1) {
-		t.Fatal("the bottom-right dot is blank; the shifted rows lost their content")
+	// Nothing was cropped: all `width` source columns are still ink, out to the
+	// last one, which now sits at width+margin-1.
+	for y := 0; y < height; y++ {
+		for x := margin; x < width+margin; x++ {
+			if !isInk(img, x, y) {
+				t.Fatalf("blank dot at (%d,%d): the margin dropped content", x, y)
+			}
+		}
 	}
 }
 
@@ -79,15 +85,39 @@ func TestZeroMarginIsByteIdentical(t *testing.T) {
 }
 
 func TestMarginIsClamped(t *testing.T) {
-	if got := clampMargin(-5, 512); got != 0 {
+	if got := clampMargin(-5); got != 0 {
 		t.Fatalf("a negative margin must clamp to 0, got %d", got)
 	}
-	if got := clampMargin(500, 512); got != MaxLeftMarginDots {
+	if got := clampMargin(500); got != MaxLeftMarginDots {
 		t.Fatalf("a margin past the cap must clamp to %d, got %d", MaxLeftMarginDots, got)
 	}
-	// Never blank the whole paper.
-	if got := clampMargin(40, 32); got != 31 {
-		t.Fatalf("a margin wider than the paper must clamp inside it, got %d", got)
+}
+
+// A margin that does not land on a byte boundary still emits whole bytes per
+// row — the raster command counts bytes, and a half-byte is a garbled row.
+func TestOffByteMarginRoundsUpToAByteBoundary(t *testing.T) {
+	opts := DefaultOptions()
+	opts.Width = 512
+	opts.NoResample = true
+	opts.LeftMarginDots = 20
+	out, err := Encode(blackImage(512, 8), opts)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	img, err := Decode(out)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got := img.Bounds().Dx(); got != 536 {
+		t.Fatalf("512 + 20 must round up to 536 dots, got %d", got)
+	}
+	for x := 0; x < 20; x++ {
+		if isInk(img, x, 0) {
+			t.Fatalf("column %d must be blank", x)
+		}
+	}
+	if !isInk(img, 531, 0) {
+		t.Fatal("the last content column (531) lost its ink")
 	}
 }
 

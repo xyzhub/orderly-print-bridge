@@ -100,7 +100,8 @@ func TestCommandDispatch(t *testing.T) {
 
 // The margin's own --decode round trip, at client #1's width: the repo's proof
 // of the byte stream is the decoder, so the paper claim ("a gap on the left")
-// is checked here without a printer. Task 49.
+// is checked here without a printer. 512 + 24 = 536 columns, first 24 blank,
+// nothing cropped (owner ruling 2026-09-08).
 func TestCLILeftMarginShiftsWithoutWidening(t *testing.T) {
 	sink := filepath.Join(t.TempDir(), "margin.escpos")
 	if err := runPrint([]string{
@@ -117,8 +118,8 @@ func TestCLILeftMarginShiftsWithoutWidening(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if got := img.Bounds().Dx(); got != 512 {
-		t.Fatalf("the margin widened the raster to %d dots; a raster wider than the head is #1079 on the other edge", got)
+	if got := img.Bounds().Dx(); got != 536 {
+		t.Fatalf("512 + a 24-dot margin must emit 536 columns, got %d", got)
 	}
 	// Every one of the first 24 columns must be white on every row.
 	for y := img.Bounds().Min.Y; y < img.Bounds().Max.Y; y++ {

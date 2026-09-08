@@ -357,16 +357,16 @@ an open UDP port for a marginal gain over "who answers on 9100".
 ### The left margin (`leftMarginDots`)
 
 A per-printer setting on the server (0 by default, capped at 64 dots ≈ 8 mm at
-203 dpi), and `--left-margin` on the one-shot CLI. It shifts the raster right
-**inside the paper width**: the first *n* dot-columns go white and the row moves
-right by *n*.
+203 dpi), and `--left-margin` on the one-shot CLI. It pads the raster on the
+left: the first *n* dot-columns go white and the emitted raster becomes
+**`widthDots` + *n* dots wide** (rounded up to a byte boundary).
 
-It does **not** widen the raster, deliberately. The daemon refuses an artifact
-whose width is not the printer's `widthDots`, and a raster emitted wider than
-the head is the same complaint on the other edge — the firmware clips or wraps
-the overflow. The cost is stated rather than hidden: the rightmost *n* columns
-of the artifact are dropped (on a receipt that hugs the left edge, those are the
-blank right margin), and the daemon logs that on every job with a margin set.
+**Nothing is cropped.** The profile's width is the CONTENT width the manager
+set — 512 on a T80C whose head is ~560 — so shifting inside it would silently
+take the rightmost columns, and that is totals disappearing off a receipt with
+nothing on paper to reveal it. A margin wider than the head is the visible
+failure instead: it shows on the test slip, and the manager lowers the margin.
+The daemon logs the emitted width on every job with a margin set.
 
 **`GS L` is not emitted.** It is a standard-mode command and no bench reading
 yet proves this head honours it in raster mode; an unverified command that does
@@ -375,7 +375,7 @@ see in `--decode`. Verify a margin without paper:
 
 ```bash
 orderly-print-bridge --image sample/receipt.png --width 512 --left-margin 24 --out m.escpos
-orderly-print-bridge --decode m.escpos --out m.png   # still 512 wide, 24 blank columns
+orderly-print-bridge --decode m.escpos --out m.png   # 536 wide: 24 blank, then all 512
 ```
 
 ### The cut (`cutMode`)

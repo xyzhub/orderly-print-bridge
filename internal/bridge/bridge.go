@@ -444,11 +444,11 @@ func (b *Bridge) execute(ctx context.Context, job *api.Job, printer api.Printer)
 		CutMode: printer.CutMode,
 	}
 	if printer.LeftMarginDots > 0 {
-		// Say it on every print, because it is a per-printer server setting a
-		// venue can change without telling anyone, and "the right edge is
-		// clipped" is otherwise an unexplainable paper symptom.
-		b.logf("job %s: left margin %d dots on %s (the artifact's rightmost %d columns are not printed)",
-			job.ID, printer.LeftMarginDots, printer.Name, printer.LeftMarginDots)
+		// Say it on every print: it is a per-printer server setting a venue can
+		// change without telling anyone, and a raster wider than the head is a
+		// paper symptom whose cause is otherwise invisible.
+		b.logf("job %s: left margin %d dots on %s (raster %d dots wide)",
+			job.ID, printer.LeftMarginDots, printer.Name, printer.WidthDots+printer.LeftMarginDots)
 	}
 	stream, err := escpos.Encode(img, opts)
 	if err != nil {

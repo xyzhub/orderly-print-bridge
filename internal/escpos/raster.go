@@ -93,19 +93,19 @@ type Options struct {
 	// multi-thousand-row command; banding keeps each command small. 0 selects
 	// the default (128).
 	BandHeight int
-	// LeftMarginDots shifts the image right by this many dots INSIDE Width —
-	// the first N columns of every row go white and the row's own content
-	// moves right by N. #1079: on a ~560-dot head a receipt rendered from
-	// column 0 hugs the paper's left edge.
+	// LeftMarginDots pads the raster on the left with this many blank dots.
+	// #1079: on a ~560-dot head a receipt rendered from column 0 hugs the
+	// paper's left edge.
 	//
-	// Why a shift inside Width and not a wider raster: Encode refuses a source
-	// whose width is not Width (NoResample, every daemon path), and a raster
-	// emitted WIDER than the head is #1079's failure on the other edge — the
-	// firmware either clips the overflow or wraps it onto the next line, which
-	// is how a receipt becomes unreadable rather than merely off-centre. The
-	// cost is honest and stated: the rightmost N dot-columns of the artifact
-	// are not printed. On the artifact this exists for, those columns are the
-	// blank right margin the complaint is about.
+	// The emitted raster is WIDER than Width — Width + LeftMarginDots, rounded
+	// up to a byte boundary — and NO CONTENT IS DROPPED (owner ruling,
+	// 2026-09-08; it supersedes master-plan task 49's "shift inside the width"
+	// wording). The reason is what the two failures cost: the profile's Width is
+	// the CONTENT width the manager set (512 on a T80C whose head is ~560), so
+	// shifting inside it would silently crop the rightmost columns — that is
+	// totals disappearing off a receipt, with nothing on paper to reveal it. An
+	// overflow is the visible failure instead: the manager SEES it on the test
+	// slip and lowers the margin (S14's stepper caps at 64 and says so).
 	//
 	// GS L (set-left-margin) is NOT emitted. It is a standard-mode command and
 	// no bench reading yet proves this head honours it in raster mode; an
@@ -113,8 +113,8 @@ type Options struct {
 	// twice on another is worse than a shift we can see in --decode. See the
 	// README.
 	//
-	// Bounded to [0, 64] and clamped below Width; 0 is byte-identical to the
-	// build before this field existed.
+	// Bounded to [0, MaxLeftMarginDots]; 0 is byte-identical to the build
+	// before this field existed.
 	LeftMarginDots int
 }
 
@@ -172,9 +172,13 @@ func Encode(src image.Image, opts Options) ([]byte, error) {
 	// 2. 1-bit conversion: dither OR threshold. mono[y*W+x] == true means black.
 	mono := to1bit(resized, opts.Dither, opts.Threshold)
 
-	// 2b. the left margin, applied to the 1-bit mask so the shifted-in columns
-	// are exactly white and no grey is invented at the seam.
-	shiftRight(mono, dstW, dstH, clampMargin(opts.LeftMarginDots, dstW))
+	// 2b. the left margin: pad the 1-bit mask on the left so the new columns are
+	// exactly white and no grey is invented at the seam. This WIDENS the
+	// raster; nothing is cropped.
+	outW := dstW
+	if margin := clampMargin(opts.LeftMarginDots); margin > 0 {
+		mono, outW = padLeft(mono, dstW, dstH, margin)
+	}
 
 	// 3. emit the stream.
 	var buf bytes.Buffer
@@ -185,13 +189,13 @@ func Encode(src image.Image, opts Options) ([]byte, error) {
 		buf.Write(cmdAlignLft)
 	}
 
-	bytesPerRow := dstW / 8
+	bytesPerRow := outW / 8
 	for y0 := 0; y0 < dstH; y0 += band {
 		rows := band
 		if y0+rows > dstH {
 			rows = dstH - y0
 		}
-		writeRasterCommand(&buf, mono, dstW, bytesPerRow, y0, rows)
+		writeRasterCommand(&buf, mono, outW, bytesPerRow, y0, rows)
 	}
 
 	buf.Write(cmdFeed)
@@ -241,37 +245,29 @@ func writeRasterCommand(buf *bytes.Buffer, mono []bool, width, bytesPerRow, y0, 
 	}
 }
 
-// clampMargin keeps a server-supplied margin inside [0, MaxLeftMarginDots] and
-// inside the paper. A margin at or past the width would print a blank receipt,
-// which is the one outcome worse than an off-centre one.
-func clampMargin(n, width int) int {
+// clampMargin keeps a server-supplied margin inside [0, MaxLeftMarginDots].
+func clampMargin(n int) int {
 	if n <= 0 {
 		return 0
 	}
 	if n > MaxLeftMarginDots {
-		n = MaxLeftMarginDots
-	}
-	if n >= width {
-		n = width - 1
+		return MaxLeftMarginDots
 	}
 	return n
 }
 
-// shiftRight moves every row of the 1-bit mask right by n dots in place,
-// whitening the first n columns and dropping the n that fall off the right.
-// The mask stays exactly width*height, so the emitted raster is still exactly
-// Width dots wide — the property the printer's head cares about.
-func shiftRight(mono []bool, width, height, n int) {
-	if n <= 0 || n >= width {
-		return
-	}
+// padLeft returns a new 1-bit mask that is n dots wider on the left, with the
+// original content intact at x+n. The result is rounded up to a byte boundary
+// (the raster command counts BYTES per row), so a margin of 20 on a 512-dot
+// image emits 536 columns with 4 blank ones on the right rather than a
+// half-byte the firmware would misread.
+func padLeft(mono []bool, width, height, n int) ([]bool, int) {
+	outW := (width + n + 7) / 8 * 8
+	out := make([]bool, outW*height)
 	for y := 0; y < height; y++ {
-		row := mono[y*width : (y+1)*width]
-		copy(row[n:], row[:width-n])
-		for x := 0; x < n; x++ {
-			row[x] = false
-		}
+		copy(out[y*outW+n:y*outW+n+width], mono[y*width:(y+1)*width])
 	}
+	return out, outW
 }
 
 // toGray converts any image to 8-bit grayscale (luminance).
