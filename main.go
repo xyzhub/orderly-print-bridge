@@ -68,6 +68,8 @@ func run() error {
 			return runServe(args[1:])
 		case "enroll":
 			return runEnroll(args[1:])
+		case "discover":
+			return runDiscover(args[1:])
 		case "version":
 			fmt.Println(version.UserAgent())
 			return nil
@@ -77,7 +79,7 @@ func run() error {
 			fmt.Print(usage)
 			return nil
 		default:
-			return fmt.Errorf("unknown command %q (try: serve, enroll, version, or the --image flags)", args[0])
+			return fmt.Errorf("unknown command %q (try: serve, enroll, discover, self-update, version, or the --image flags)", args[0])
 		}
 	}
 	return runPrint(args)

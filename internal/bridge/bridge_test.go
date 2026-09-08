@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -553,5 +554,113 @@ func TestPrinterTargetURIs(t *testing.T) {
 		if got := p.Target(); got != want {
 			t.Errorf("Target() = %q, want %q", got, want)
 		}
+	}
+}
+
+// Task 49: what the sweep finds is REPORTED on the heartbeat and nowhere else.
+func TestSweepResultsRideTheHeartbeat(t *testing.T) {
+	srv := apitest.New(t)
+	b := newBridge(t, srv)
+	swept := make(chan struct{}, 1)
+	b.Discover = func(context.Context) ([]api.DiscoveredPrinter, error) {
+		defer func() { swept <- struct{}{} }()
+		return []api.DiscoveredPrinter{
+			{Address: "192.168.1.50:9100", Transport: api.TransportTCP, Identity: "TM-T20III"},
+			{Address: "usb:/dev/usb/lp0", Transport: api.TransportUSB, Model: "EPSON TM-T20III"},
+		}, nil
+	}
+
+	// First tick starts the sweep; the heartbeat it sends may or may not carry
+	// the result, so wait for the sweep and force a second heartbeat.
+	if err := b.Tick(context.Background()); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	<-swept
+	b.lastHeartbeat = time.Time{}
+	if err := b.Tick(context.Background()); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+
+	beats := srv.Heartbeats()
+	last := beats[len(beats)-1]
+	if len(last.Discovered) != 2 {
+		t.Fatalf("the heartbeat carried %d candidates, want 2: %+v", len(last.Discovered), last.Discovered)
+	}
+	if last.Discovered[1].Address != "usb:/dev/usb/lp0" {
+		t.Fatalf("the USB candidate did not survive the wire: %+v", last.Discovered)
+	}
+	// PrintersDiscovered stays the ASSIGNED count — the sweep must not inflate
+	// the number the manager page reads as "printers this device prints on".
+	if last.PrintersDiscovered != 0 {
+		t.Fatalf("printersDiscovered = %d; a swept candidate is not an assignment", last.PrintersDiscovered)
+	}
+}
+
+// A candidate is never routing input: with a sweep full of printers and no
+// assignment, a welcome slip still refuses to print.
+func TestDiscoveredCandidatesAreNeverRoutingInput(t *testing.T) {
+	srv := apitest.New(t)
+	b := newBridge(t, srv) // no assigned printers
+	b.Discover = func(context.Context) ([]api.DiscoveredPrinter, error) {
+		return []api.DiscoveredPrinter{{Address: "192.168.1.50:9100", Transport: api.TransportTCP, Identity: "TM-T20III"}}, nil
+	}
+	b.SweepNow(context.Background())
+	deadline := time.Now().Add(2 * time.Second)
+	for len(b.Discovered()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(b.Discovered()) != 1 {
+		t.Fatal("the sweep did not record its candidate")
+	}
+
+	target, reason := b.WelcomeTarget()
+	if target != nil {
+		t.Fatalf("a DISCOVERED printer was selected as a print target: %+v", target)
+	}
+	if !strings.Contains(reason, "no printer is configured") {
+		t.Fatalf("reason = %q", reason)
+	}
+}
+
+// The sweep is rate-limited, and never runs two at once.
+func TestSweepRespectsItsInterval(t *testing.T) {
+	srv := apitest.New(t)
+	b := newBridge(t, srv)
+	var calls int32
+	b.SweepInterval = time.Hour
+	b.Discover = func(context.Context) ([]api.DiscoveredPrinter, error) {
+		atomic.AddInt32(&calls, 1)
+		return nil, nil
+	}
+	for i := 0; i < 5; i++ {
+		if err := b.Tick(context.Background()); err != nil {
+			t.Fatalf("tick %d: %v", i, err)
+		}
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("five ticks inside the interval ran %d sweeps, want 1", got)
+	}
+	// SIGUSR1's path ignores the interval.
+	b.SweepNow(context.Background())
+	time.Sleep(50 * time.Millisecond)
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("an on-demand sweep did not run: %d", got)
+	}
+}
+
+// A failing sweep is a log line, never a failed tick — printing is unaffected.
+func TestSweepFailureDoesNotBreakTheLoop(t *testing.T) {
+	srv := apitest.New(t)
+	b := newBridge(t, srv)
+	b.Discover = func(context.Context) ([]api.DiscoveredPrinter, error) {
+		return nil, errors.New("no usable interface")
+	}
+	if err := b.Tick(context.Background()); err != nil {
+		t.Fatalf("a broken sweep must not fail the poll cycle: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if b.Discovered() != nil {
+		t.Fatal("a failed sweep must not publish candidates")
 	}
 }

@@ -33,10 +33,12 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/xyz/orderly-print-bridge/internal/api"
 	"github.com/xyz/orderly-print-bridge/internal/config"
+	"github.com/xyz/orderly-print-bridge/internal/discover"
 	"github.com/xyz/orderly-print-bridge/internal/escpos"
 	"github.com/xyz/orderly-print-bridge/internal/transport"
 	"github.com/xyz/orderly-print-bridge/internal/version"
@@ -58,6 +60,11 @@ type Sender func(target string, data []byte) (int, error)
 // Prober asks a printer target a short question (the `GS I` identity query).
 type Prober func(target string, cmd []byte) ([]byte, error)
 
+// Sweeper lists the printer candidates this box can see. Its result is
+// REPORTED, never routed to: the daemon prints only to what the server assigned
+// (master-plan task 49).
+type Sweeper func(ctx context.Context) ([]api.DiscoveredPrinter, error)
+
 // Bridge is one enrolled device's print loop.
 type Bridge struct {
 	Client *api.Client
@@ -65,16 +72,27 @@ type Bridge struct {
 
 	Send  Sender
 	Probe Prober
+	// Discover runs the LAN + USB sweep. nil disables discovery entirely.
+	Discover Sweeper
 
 	PollInterval      time.Duration
 	HeartbeatInterval time.Duration
 	AckTimeout        time.Duration
+	// SweepInterval is the MINIMUM gap between sweeps (discover.SweepInterval).
+	SweepInterval time.Duration
 
 	Logf func(format string, args ...any)
 	Now  func() time.Time
 
 	lastHeartbeat time.Time
 	hostname      string
+
+	// mu guards the sweep's state: the sweep runs on its own goroutine so a
+	// 10-second probe of a venue's /24 can never delay a receipt.
+	mu         sync.Mutex
+	discovered []api.DiscoveredPrinter
+	lastSweep  time.Time
+	sweeping   bool
 }
 
 // New builds a Bridge for an enrolled config with production defaults.
@@ -88,9 +106,11 @@ func New(cfg *config.Config) *Bridge {
 		Cfg:               cfg,
 		Send:              transport.Send,
 		Probe:             transport.Query,
+		Discover:          DefaultSweep,
 		PollInterval:      DefaultPollInterval,
 		HeartbeatInterval: DefaultHeartbeatInterval,
 		AckTimeout:        DefaultAckTimeout,
+		SweepInterval:     discover.SweepInterval,
 		Now:               time.Now,
 		hostname:          host,
 	}
@@ -125,6 +145,77 @@ func (b *Bridge) defaults() {
 	if b.AckTimeout <= 0 {
 		b.AckTimeout = DefaultAckTimeout
 	}
+	if b.SweepInterval <= 0 {
+		b.SweepInterval = discover.SweepInterval
+	}
+}
+
+// DefaultSweep is the production sweeper: this box's own /24 on TCP 9100 plus
+// its Linux USB printer nodes.
+func DefaultSweep(ctx context.Context) ([]api.DiscoveredPrinter, error) {
+	return discover.Sweep(ctx, discover.Options{})
+}
+
+// SweepNow runs a sweep immediately, ignoring SweepInterval. It is what SIGUSR1
+// is wired to: an installer standing at the counter must not have to wait out
+// the interval to see the printer they just plugged in.
+func (b *Bridge) SweepNow(ctx context.Context) {
+	b.defaults()
+	b.startSweep(ctx, true)
+}
+
+// sweepIfDue starts a background sweep when one is due. It never blocks the
+// caller and never runs two at once.
+func (b *Bridge) sweepIfDue(ctx context.Context) { b.startSweep(ctx, false) }
+
+func (b *Bridge) startSweep(ctx context.Context, force bool) {
+	if b.Discover == nil {
+		return
+	}
+	b.mu.Lock()
+	due := force || b.lastSweep.IsZero() || b.now().Sub(b.lastSweep) >= b.SweepInterval
+	if !due || b.sweeping {
+		b.mu.Unlock()
+		return
+	}
+	b.sweeping = true
+	b.lastSweep = b.now()
+	b.mu.Unlock()
+
+	// Detached: the sweep must outlive one poll tick, and a cancelled parent
+	// mid-sweep would leave `sweeping` stuck true.
+	go func() {
+		defer func() {
+			b.mu.Lock()
+			b.sweeping = false
+			b.mu.Unlock()
+		}()
+		found, err := b.Discover(context.WithoutCancel(ctx))
+		if err != nil {
+			b.logf("printer discovery failed (nothing else is affected): %v", err)
+			return
+		}
+		if len(found) > api.MaxDiscovered {
+			found = found[:api.MaxDiscovered]
+		}
+		b.mu.Lock()
+		b.discovered = found
+		b.mu.Unlock()
+		b.logf("printer discovery: %d candidate(s) visible from this box", len(found))
+	}()
+}
+
+// Discovered returns the last sweep's candidates. They are display data for the
+// manager page and nothing else — never an input to selectPrinter.
+func (b *Bridge) Discovered() []api.DiscoveredPrinter {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.discovered) == 0 {
+		return nil
+	}
+	out := make([]api.DiscoveredPrinter, len(b.discovered))
+	copy(out, b.discovered)
+	return out
 }
 
 // Run polls until the context is cancelled or the device is revoked.
@@ -160,6 +251,9 @@ func (b *Bridge) Run(ctx context.Context) error {
 // can drive the loop deterministically instead of sleeping.
 func (b *Bridge) Tick(ctx context.Context) error {
 	b.defaults()
+	// Started before the heartbeat so the first heartbeat after a sweep carries
+	// its result; it returns immediately either way.
+	b.sweepIfDue(ctx)
 	if err := b.heartbeatIfDue(ctx); err != nil {
 		return err
 	}
@@ -199,6 +293,7 @@ func (b *Bridge) heartbeatIfDue(ctx context.Context) error {
 		Arch:               runtime.GOARCH,
 		Hostname:           b.hostname,
 		PrintersDiscovered: b.PrintersDiscovered(),
+		Discovered:         b.Discovered(),
 	})
 	if err != nil {
 		return b.classify(err)

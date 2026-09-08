@@ -13,6 +13,7 @@ import (
 
 	"github.com/xyz/orderly-print-bridge/internal/bridge"
 	"github.com/xyz/orderly-print-bridge/internal/config"
+	"github.com/xyz/orderly-print-bridge/internal/discover"
 	"github.com/xyz/orderly-print-bridge/internal/enroll"
 	"github.com/xyz/orderly-print-bridge/internal/tailnet"
 	"github.com/xyz/orderly-print-bridge/internal/version"
@@ -33,6 +34,10 @@ FLAGS
   --no-local-page      do not fall back to the setup page on 127.0.0.1:47831
   --poll <duration>    poll interval (default 3s)
   --once               run one poll cycle and exit (for smoke tests)
+
+SIGNALS
+  SIGUSR1              sweep the LAN + USB for printers right now (POSIX only);
+                       otherwise the sweep runs at most every 10 minutes
 `
 
 const enrollUsage = `orderly-print-bridge enroll — claim a setup code, store the token, exit
@@ -167,6 +172,9 @@ func runServe(args []string) error {
 		return b.Tick(ctx)
 	}
 
+	// `systemctl kill -s USR1 orderly-bridge` = sweep for printers now.
+	onDemandSweep(ctx, b, logger.Printf)
+
 	err = b.Run(ctx)
 	switch {
 	case errors.Is(err, context.Canceled):
@@ -247,4 +255,55 @@ func loadOrEnroll(ctx context.Context, c *commonFlags) (*config.Config, error) {
 			backoff *= 2
 		}
 	}
+}
+
+const discoverUsage = `orderly-print-bridge discover — list the printers this machine can see
+
+  Probes this box's own /24 for TCP 9100 and asks each responder for its ESC/POS
+  identity, then lists the Linux USB printer nodes (/dev/usb/lp*). It prints
+  what it found and exits.
+
+  This is a LOOK, never a routing decision: the daemon prints only to the
+  printer Orderly assigned it. Paste an address below into Orderly's printer
+  form to make it one.
+`
+
+// runDiscover is the operator's copy of the daemon's sweep — the answer to
+// "what is the printer's address?" without a subnet scanner on a venue's PC.
+func runDiscover(args []string) error {
+	fs := flag.NewFlagSet("discover", flag.ContinueOnError)
+	fs.Usage = func() { fmt.Fprint(os.Stderr, discoverUsage) }
+	quiet := fs.Bool("quiet", false, "print only the addresses, one per line")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	opts := discover.Options{}
+	if !*quiet {
+		opts.Logf = logger.Printf
+	}
+	found, err := discover.Sweep(ctx, opts)
+	if err != nil {
+		return err
+	}
+	if len(found) == 0 {
+		fmt.Println("No printers answered on this network, and no USB printer nodes are present.")
+		fmt.Println("Check the printer is powered on, on this LAN (or plugged in), and that raw printing (port 9100) is enabled.")
+		return nil
+	}
+	for _, c := range found {
+		if *quiet {
+			fmt.Println(c.Address)
+			continue
+		}
+		label := c.Model
+		if label == "" {
+			label = "unidentified — answered on 9100 but did not say what it is"
+		}
+		fmt.Printf("%-28s  %-4s  %s\n", c.Address, c.Transport, label)
+	}
+	return nil
 }
