@@ -34,6 +34,9 @@ FLAGS
   --no-local-page      do not fall back to the setup page on 127.0.0.1:47831
   --poll <duration>    poll interval (default 3s)
   --once               run one poll cycle and exit (for smoke tests)
+  --update-check <d>   how often to check for a new release (default 24h, 0 off)
+  --auto-update        install a new release automatically, then restart
+  --unit <name>        systemd unit to restart after an automatic update
 
 SIGNALS
   SIGUSR1              sweep the LAN + USB for printers right now (POSIX only);
@@ -150,6 +153,9 @@ func runServe(args []string) error {
 	bindCommon(fs, &c)
 	poll := fs.Duration("poll", bridge.DefaultPollInterval, "poll interval")
 	once := fs.Bool("once", false, "run a single poll cycle and exit")
+	updateEvery := fs.Duration("update-check", 24*time.Hour, "how often to check for a new release (0 disables)")
+	autoUpdate := fs.Bool("auto-update", false, "install a new release automatically and restart")
+	unit := fs.String("unit", DefaultServiceUnit, "systemd unit to restart after an automatic update")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -174,6 +180,9 @@ func runServe(args []string) error {
 
 	// `systemctl kill -s USR1 orderly-bridge` = sweep for printers now.
 	onDemandSweep(ctx, b, logger.Printf)
+	// Every ~24 h: say whether a new release exists (and with --auto-update,
+	// install it). The install path of record is still the nightly timer.
+	watchForUpdates(ctx, *updateEvery, *autoUpdate, *unit)
 
 	err = b.Run(ctx)
 	switch {

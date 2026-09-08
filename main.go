@@ -70,6 +70,8 @@ func run() error {
 			return runEnroll(args[1:])
 		case "discover":
 			return runDiscover(args[1:])
+		case "self-update", "update":
+			return runSelfUpdate(args[1:])
 		case "version":
 			fmt.Println(version.UserAgent())
 			return nil

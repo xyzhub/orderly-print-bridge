@@ -7,9 +7,10 @@
 //	usb:///dev/usb/lp0  the same thing with an authority-style scheme
 //	file:///path/out    write the bytes to a file (dry run / capture)
 //
-// A bare path with no scheme (e.g. /dev/usb/lp0 or ./out.bin) is treated as a
-// raw device/file write. This keeps the common "just point it at the device"
-// case terse.
+// A bare path with no scheme (e.g. /dev/usb/lp0 or ./out.bin) still works —
+// that is the spelling a `DevicePrinter` row carried before `usb:` existed, and
+// the one an operator types. A bare path under /dev/ takes the device path
+// (never created); anything else is a plain file write.
 //
 // `usb:` and `file:` differ in one deliberate way: a usb target is NEVER
 // created. A device node exists or it does not, and creating a regular file at
@@ -56,8 +57,14 @@ func Send(target string, data []byte) (int, error) {
 		return sendDevice(strings.TrimPrefix(target, "file://"), data)
 	case strings.Contains(target, "://"):
 		return 0, fmt.Errorf("unsupported printer scheme in %q (use tcp://, usb://, or file://)", target)
+	case strings.HasPrefix(target, "/dev/"):
+		// A bare device path — the spelling a printer row carried before the
+		// `usb:` scheme existed, and the one an operator types. It gets the
+		// hardened device path, not the file path: nothing may ever CREATE a
+		// node under /dev.
+		return sendUSB(target, data)
 	default:
-		// Bare path: raw device or file.
+		// Bare path: raw file (a capture sink, a dry run).
 		return sendDevice(target, data)
 	}
 }

@@ -112,3 +112,23 @@ func TestSendUSBRejectsAnEmptyPath(t *testing.T) {
 		t.Fatal("an empty usb path must fail")
 	}
 }
+
+// Backward compatibility: a printer row from before the `usb:` scheme carries a
+// BARE /dev path, and the daemon on the staging box already sends bytes that
+// way. All three spellings must reach the same hardened device path.
+func TestBareDevPathUsesTheDevicePathAndNeverCreates(t *testing.T) {
+	missing := "/dev/usb/lp-orderly-does-not-exist"
+	n, err := Send(missing, []byte("x"))
+	if err == nil {
+		t.Fatal("a missing device node must fail, not be created")
+	}
+	if n != 0 {
+		t.Fatalf("bytes written = %d, want 0", n)
+	}
+	if !strings.Contains(err.Error(), "no such device") && !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("want the device error, got %v", err)
+	}
+	if _, statErr := os.Stat(missing); statErr == nil {
+		t.Fatalf("Send CREATED %s", missing)
+	}
+}
