@@ -41,9 +41,10 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
         with:
+          cache: false # zero-dependency module: no go.sum to key a cache on
           go-version: '1.26'
           cache: false
       - run: go vet ./...
@@ -60,9 +61,10 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
         with:
+          cache: false # zero-dependency module: no go.sum to key a cache on
           go-version: '1.26'
           cache: false
 
