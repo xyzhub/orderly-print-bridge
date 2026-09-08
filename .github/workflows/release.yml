@@ -123,7 +123,7 @@ jobs:
           cat SHA256SUMS
 
       - name: create the release and upload the assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           # No release exists for a tag until this runs — v1.0.0 has none, which
           # is why install.sh could not have fetched anything.
