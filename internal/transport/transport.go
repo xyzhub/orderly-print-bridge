@@ -3,12 +3,19 @@
 // Three target forms are supported, chosen by URI scheme:
 //
 //	tcp://HOST:9100     raw TCP socket to a network ESC/POS printer (universal)
-//	usb:///dev/usb/lp0  a raw character device (Linux lp, macOS/BSD, or any path)
+//	usb:/dev/usb/lp0    a USB printer-class device node (Linux usblp, macOS/BSD)
+//	usb:///dev/usb/lp0  the same thing with an authority-style scheme
 //	file:///path/out    write the bytes to a file (dry run / capture)
 //
-// A bare path with no scheme (e.g. /dev/usb/lp0 or ./out.bin) is treated as a
-// raw device/file write. This keeps the common "just point it at the device"
-// case terse.
+// A bare path with no scheme (e.g. /dev/usb/lp0 or ./out.bin) still works —
+// that is the spelling a `DevicePrinter` row carried before `usb:` existed, and
+// the one an operator types. A bare path under /dev/ takes the device path
+// (never created); anything else is a plain file write.
+//
+// `usb:` and `file:` differ in one deliberate way: a usb target is NEVER
+// created. A device node exists or it does not, and creating a regular file at
+// /dev/usb/lp0 because the printer was unplugged would turn "the printer is
+// off" into a silent success that swallows every receipt.
 package transport
 
 import (
@@ -41,13 +48,23 @@ func Send(target string, data []byte) (int, error) {
 		return sendTCP(strings.TrimPrefix(target, "tcp://"), data)
 	case strings.HasPrefix(target, "usb://"):
 		// usb:///dev/usb/lp0 -> /dev/usb/lp0  (strip scheme, keep leading slash)
-		return sendDevice(strings.TrimPrefix(target, "usb://"), data)
+		return sendUSB(strings.TrimPrefix(target, "usb://"), data)
+	case strings.HasPrefix(target, "usb:"):
+		// usb:/dev/usb/lp0 — the form the discovery sweep reports, so a manager
+		// can paste a swept address straight into the printer form.
+		return sendUSB(strings.TrimPrefix(target, "usb:"), data)
 	case strings.HasPrefix(target, "file://"):
 		return sendDevice(strings.TrimPrefix(target, "file://"), data)
 	case strings.Contains(target, "://"):
 		return 0, fmt.Errorf("unsupported printer scheme in %q (use tcp://, usb://, or file://)", target)
+	case strings.HasPrefix(target, "/dev/"):
+		// A bare device path — the spelling a printer row carried before the
+		// `usb:` scheme existed, and the one an operator types. It gets the
+		// hardened device path, not the file path: nothing may ever CREATE a
+		// node under /dev.
+		return sendUSB(target, data)
 	default:
-		// Bare path: raw device or file.
+		// Bare path: raw file (a capture sink, a dry run).
 		return sendDevice(target, data)
 	}
 }
@@ -99,6 +116,86 @@ func sendDevice(path string, data []byte) (int, error) {
 		return n, fmt.Errorf("write %s (%d of %d bytes sent): %w", path, n, len(data), err)
 	}
 	return n, nil
+}
+
+// USBOpenTimeout bounds opening a device node. A var, not a const, so the test
+// does not have to wait eight seconds on a FIFO with no reader.
+//
+// The timeout is not decoration: opening a usblp node whose printer is powered
+// off, or a FIFO with nothing on the other end, blocks in the kernel with no
+// deadline of its own, and a blocked open inside the daemon's 60 s job budget
+// is a job that expires without ever saying why.
+var USBOpenTimeout = 8 * time.Second
+
+// sendUSB writes an ESC/POS stream to a USB printer-class device node.
+func sendUSB(path string, data []byte) (int, error) {
+	if path == "" {
+		return 0, fmt.Errorf("empty USB device path (expected usb:/dev/usb/lp0)")
+	}
+	f, err := openDeviceWithTimeout(path, USBOpenTimeout)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	// Best-effort: a character device is often not pollable, in which case the
+	// runtime answers ErrNoDeadline and the write is bounded by the daemon's
+	// 60 s job budget instead. Not an error either way.
+	if err := f.SetWriteDeadline(time.Now().Add(WriteTimeout)); err != nil && !errors.Is(err, os.ErrNoDeadline) {
+		return 0, fmt.Errorf("set write deadline on %s: %w", path, err)
+	}
+	n, err := f.Write(data)
+	if err != nil {
+		return n, fmt.Errorf("write %s (%d of %d bytes sent): %w", path, n, len(data), err)
+	}
+	return n, nil
+}
+
+// openDeviceWithTimeout opens path O_WRONLY, giving up after timeout. A late
+// success is closed by the goroutine so an unplugged-then-replugged printer
+// cannot leave a stray write handle open.
+func openDeviceWithTimeout(path string, timeout time.Duration) (*os.File, error) {
+	type opened struct {
+		f   *os.File
+		err error
+	}
+	ch := make(chan opened, 1)
+	go func() {
+		f, err := os.OpenFile(path, os.O_WRONLY, 0)
+		ch <- opened{f, err}
+	}()
+	select {
+	case got := <-ch:
+		if got.err != nil {
+			return nil, describeOpenError(path, got.err)
+		}
+		return got.f, nil
+	case <-time.After(timeout):
+		go func() {
+			if late := <-ch; late.f != nil {
+				late.f.Close()
+			}
+		}()
+		return nil, fmt.Errorf("open %s: the device did not accept a connection within %s "+
+			"(is the printer powered on and the cable seated?)", path, timeout)
+	}
+}
+
+// describeOpenError turns the two failures an operator actually hits into
+// sentences that name the fix.
+func describeOpenError(path string, err error) error {
+	switch {
+	case errors.Is(err, os.ErrPermission):
+		// The systemd unit runs as root on a box, but a client's PC install may
+		// not — and "permission denied" alone sends the operator nowhere.
+		return fmt.Errorf("open %s: permission denied — the account running the bridge must be in the `lp` group "+
+			"(sudo usermod -aG lp $USER, then log out and back in), or run the bridge as root: %w", path, err)
+	case errors.Is(err, os.ErrNotExist):
+		return fmt.Errorf("open %s: no such device — the printer is unplugged, powered off, "+
+			"or the usblp kernel module is not loaded: %w", path, err)
+	default:
+		return fmt.Errorf("open %s: %w", path, err)
+	}
 }
 
 // QueryTimeout bounds an identity query. A printer that has not answered in

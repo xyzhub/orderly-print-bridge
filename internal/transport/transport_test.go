@@ -40,7 +40,13 @@ func TestSendBarePathAndUSBScheme(t *testing.T) {
 	if n, err := Send(filepath.Join(dir, "bare"), data); err != nil || n != 2 {
 		t.Fatalf("bare path: n=%d err=%v", n, err)
 	}
-	if n, err := Send("usb://"+filepath.Join(dir, "usbdev"), data); err != nil || n != 2 {
+	// A usb target is never created — see TestSendUSBRefusesAMissingNode. The
+	// node has to exist, exactly as a real /dev/usb/lp0 does.
+	node := filepath.Join(dir, "usbdev")
+	if err := os.WriteFile(node, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := Send("usb://"+node, data); err != nil || n != 2 {
 		t.Fatalf("usb scheme: n=%d err=%v", n, err)
 	}
 }

@@ -25,6 +25,30 @@ var (
 	cmdFullCut  = []byte{0x1d, 0x56, 0x00}       // GS V 0     full cut
 )
 
+// Cut modes for Options.CutMode.
+//
+// Observed on the owner's T80C over USB, 2026-09-08: the head IGNORES BOTH
+// partial-cut forms (`GS V 66 0` — this package's original hard-coded trailer —
+// and `GS V 1`, and `ESC i`) while honouring `GS V 0`. The byte counts proved
+// the trailer was sent, so this is the printer's behaviour, not a lost write. A
+// cut command is therefore a PER-PRINTER FACT, not a constant, and the default
+// is now the form that was seen to work.
+//
+// `GS V 65 3` cuts on that head too, but it feeds three extra units first and
+// the owner read the result as wasted paper (2026-09-08 15:37) — the 4-LF feed
+// this package already emits is enough to clear the head.
+const (
+	// CutFull emits the existing feed followed by GS V 0. The DEFAULT.
+	CutFull = "full"
+	// CutPartial emits GS V 66 0 (the pre-2026-09-08 behaviour). Keep it for
+	// heads that leave the receipt hanging by a tab, which many venues prefer.
+	CutPartial = "partial"
+	// CutNone emits no cut command at all — for a head with no cutter, or one
+	// with a tear bar, where a cut command is at best ignored and at worst an
+	// error beep.
+	CutNone = "none"
+)
+
 // CmdIdentity is the ESC/POS identity query `GS I 1` (transmit printer model
 // ID). It is how a candidate on port 9100 is asked to prove it is a thermal
 // printer before a welcome slip is sent to it — an office LaserJet answers
@@ -48,7 +72,14 @@ type Options struct {
 	Threshold uint8
 	// Center emits ESC a 1 so the image is centered on the paper.
 	Center bool
-	// FullCut emits GS V 0 (full cut) instead of GS V 66 0 (partial cut).
+	// CutMode is "full" (default), "partial" or "none" — see the constants
+	// above. An unknown or empty value means "full": a printer profile that
+	// arrives from a future server with a mode this build does not know must
+	// still cut the paper.
+	CutMode string
+	// FullCut is the CLI's legacy `--full-cut`: it emits the bare GS V 0. It
+	// applies only when CutMode is empty, so a server-supplied mode always
+	// wins. Kept because the paper tests are driven by that flag.
 	FullCut bool
 	// NoResample rejects, instead of rescaling, a source image whose width is
 	// not already Width. The server renders the artifact at the printer's
@@ -62,7 +93,33 @@ type Options struct {
 	// multi-thousand-row command; banding keeps each command small. 0 selects
 	// the default (128).
 	BandHeight int
+	// LeftMarginDots pads the raster on the left with this many blank dots.
+	// #1079: on a ~560-dot head a receipt rendered from column 0 hugs the
+	// paper's left edge.
+	//
+	// The emitted raster is WIDER than Width — Width + LeftMarginDots, rounded
+	// up to a byte boundary — and NO CONTENT IS DROPPED (owner ruling,
+	// 2026-09-08; it supersedes master-plan task 49's "shift inside the width"
+	// wording). The reason is what the two failures cost: the profile's Width is
+	// the CONTENT width the manager set (512 on a T80C whose head is ~560), so
+	// shifting inside it would silently crop the rightmost columns — that is
+	// totals disappearing off a receipt, with nothing on paper to reveal it. An
+	// overflow is the visible failure instead: the manager SEES it on the test
+	// slip and lowers the margin (S14's stepper caps at 64 and says so).
+	//
+	// GS L (set-left-margin) is NOT emitted. It is a standard-mode command and
+	// no bench reading yet proves this head honours it in raster mode; an
+	// unverified command that silently does nothing on one model and shifts
+	// twice on another is worse than a shift we can see in --decode. See the
+	// README.
+	//
+	// Bounded to [0, MaxLeftMarginDots]; 0 is byte-identical to the build
+	// before this field existed.
+	LeftMarginDots int
 }
+
+// MaxLeftMarginDots bounds Options.LeftMarginDots (~8mm at 203dpi).
+const MaxLeftMarginDots = 64
 
 // DefaultOptions returns sane defaults for an 80mm thermal receipt.
 func DefaultOptions() Options {
@@ -115,6 +172,14 @@ func Encode(src image.Image, opts Options) ([]byte, error) {
 	// 2. 1-bit conversion: dither OR threshold. mono[y*W+x] == true means black.
 	mono := to1bit(resized, opts.Dither, opts.Threshold)
 
+	// 2b. the left margin: pad the 1-bit mask on the left so the new columns are
+	// exactly white and no grey is invented at the seam. This WIDENS the
+	// raster; nothing is cropped.
+	outW := dstW
+	if margin := clampMargin(opts.LeftMarginDots); margin > 0 {
+		mono, outW = padLeft(mono, dstW, dstH, margin)
+	}
+
 	// 3. emit the stream.
 	var buf bytes.Buffer
 	buf.Write(cmdInit)
@@ -124,22 +189,36 @@ func Encode(src image.Image, opts Options) ([]byte, error) {
 		buf.Write(cmdAlignLft)
 	}
 
-	bytesPerRow := dstW / 8
+	bytesPerRow := outW / 8
 	for y0 := 0; y0 < dstH; y0 += band {
 		rows := band
 		if y0+rows > dstH {
 			rows = dstH - y0
 		}
-		writeRasterCommand(&buf, mono, dstW, bytesPerRow, y0, rows)
+		writeRasterCommand(&buf, mono, outW, bytesPerRow, y0, rows)
 	}
 
 	buf.Write(cmdFeed)
-	if opts.FullCut {
-		buf.Write(cmdFullCut)
-	} else {
-		buf.Write(cmdPartCut)
-	}
+	buf.Write(cutCommand(opts))
 	return buf.Bytes(), nil
+}
+
+// cutCommand picks the trailer. Order matters: an explicit CutMode from the
+// server beats the CLI's legacy boolean, and anything unrecognised falls back to
+// a full cut rather than to no cut — an uncut receipt is a receipt the next
+// order prints on top of.
+func cutCommand(opts Options) []byte {
+	switch opts.CutMode {
+	case CutPartial:
+		return cmdPartCut
+	case CutNone:
+		// Feed only. The feed is written by the caller, so a tear-bar head
+		// still advances the receipt clear of the mechanism.
+		return nil
+	}
+	// "full", the legacy --full-cut boolean, an empty mode and anything a
+	// future server invents all land here: cut the paper.
+	return cmdFullCut
 }
 
 // writeRasterCommand emits one GS v 0 command for rows [y0, y0+rows) of mono.
@@ -164,6 +243,31 @@ func writeRasterCommand(buf *bytes.Buffer, mono []bool, width, bytesPerRow, y0, 
 			buf.WriteByte(b)
 		}
 	}
+}
+
+// clampMargin keeps a server-supplied margin inside [0, MaxLeftMarginDots].
+func clampMargin(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	if n > MaxLeftMarginDots {
+		return MaxLeftMarginDots
+	}
+	return n
+}
+
+// padLeft returns a new 1-bit mask that is n dots wider on the left, with the
+// original content intact at x+n. The result is rounded up to a byte boundary
+// (the raster command counts BYTES per row), so a margin of 20 on a 512-dot
+// image emits 536 columns with 4 blank ones on the right rather than a
+// half-byte the firmware would misread.
+func padLeft(mono []bool, width, height, n int) ([]bool, int) {
+	outW := (width + n + 7) / 8 * 8
+	out := make([]bool, outW*height)
+	for y := 0; y < height; y++ {
+		copy(out[y*outW+n:y*outW+n+width], mono[y*width:(y+1)*width])
+	}
+	return out, outW
 }
 
 // toGray converts any image to 8-bit grayscale (luminance).

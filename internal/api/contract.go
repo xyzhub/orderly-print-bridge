@@ -43,6 +43,19 @@
 //     (`poll.ts` claims only when the role's printer belongs to this device).
 //     The welcome/test candidate gate stays as defence, not as a normal path.
 //
+// # Phase 4 additions (master-plan tasks 48 and 49)
+//
+// Three fields land here BEFORE the server sends them (S13 adds the server
+// half), so every one of them is optional and its absence is the normal,
+// non-failing case for any Orderly older than that session:
+//
+//   - `EnrollResponse.Tailscale` — the minted tailnet join (LD-31). Absent ⇒
+//     one log line, no join, printing unaffected.
+//   - `Printer.LeftMarginDots` — #1079. Absent ⇒ 0 ⇒ byte-identical output.
+//   - `Printer.CutMode` — the 2026-09-08 T80C cut finding. Absent ⇒ "full".
+//   - `HeartbeatRequest.Discovered` — the sweep payload. The shipped handler
+//     already accepts and drops it, so sending it is safe today.
+//
 // # Still open
 //
 //   - `welcome` / `test` artifacts currently answer 501
@@ -52,7 +65,10 @@ package api
 
 import (
 	"regexp"
+	"strings"
 	"time"
+
+	"github.com/xyz/orderly-print-bridge/internal/secret"
 )
 
 // Paths on the Orderly server. Kept together so a route rename is one edit.
@@ -165,6 +181,27 @@ type EnrollResponse struct {
 	DeviceID string `json:"deviceId"`
 	VenueID  string `json:"venueId"`
 	Name     string `json:"name,omitempty"`
+	// Tailscale is the OPTIONAL tailnet join the server minted for this box
+	// (master-plan task 48). It is absent on every server build before S13 and
+	// on every deployment that has no Tailscale credentials configured, so a
+	// nil block is the NORMAL case, not a failure: the daemon logs one line and
+	// carries on printing (P-17).
+	Tailscale *TailscaleJoin `json:"tailscale,omitempty"`
+}
+
+// TailscaleJoin is a one-shot, pre-authorized, non-reusable auth key plus the
+// name the box should carry on the tailnet (LD-31).
+//
+// AuthKey is a secret.Secret from the moment the JSON decoder writes it, so it
+// redacts through %v/%s/%q and through any json.Marshal of a struct that holds
+// it. It is NEVER written to bridge.json (LD-17) and never passed on a command
+// line — `internal/tailnet` hands it to `tailscale up` through a 0600 file that
+// is shredded afterwards, because argv is world-readable in /proc.
+type TailscaleJoin struct {
+	AuthKey     secret.Secret `json:"authKey"`
+	Hostname    string        `json:"hostname,omitempty"`
+	Tags        []string      `json:"tags,omitempty"`
+	LoginServer string        `json:"loginServer,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -185,16 +222,35 @@ type HeartbeatRequest struct {
 	Arch               string `json:"arch,omitempty"`
 	Hostname           string `json:"hostname,omitempty"`
 	PrintersDiscovered int    `json:"printersDiscovered"`
-	// Discovered is the Phase-4 sweep payload. v1 always sends nil.
+	// Discovered is the Phase-4 sweep payload (`internal/discover`): what this
+	// box can SEE, never what it prints to. The server drops it until S13
+	// stores it, and even then it is display-only — a candidate list posted by
+	// an agent must never become routing input.
 	Discovered []DiscoveredPrinter `json:"discovered,omitempty"`
 }
 
-// DiscoveredPrinter is the Phase-4 candidate shape, declared now so the field
-// name is fixed. v1 never populates it.
+// MaxDiscovered caps the sweep payload. The server's own schema takes 64
+// entries; 50 keeps a /24 full of JetDirect boxes from turning one heartbeat
+// into a page of noise, and a venue with 50 printers has a different problem.
+const MaxDiscovered = 50
+
+// DiscoveredPrinter is one candidate the sweep saw. `Address` and `Transport`
+// are the two fields the server has always accepted; the rest are what a human
+// reads on the manager page when deciding which of three boxes is the kitchen
+// printer.
 type DiscoveredPrinter struct {
-	Address   string `json:"address"`
-	Transport string `json:"transport"`
+	Address   string `json:"address"`            // "192.168.1.50:9100" | "usb:/dev/usb/lp0"
+	Transport string `json:"transport"`          // "tcp" | "usb"
 	Identity  string `json:"identity,omitempty"` // the GS I reply, if any
+	// Model is a human label: the printed form of the GS I reply for a network
+	// printer, or "<manufacturer> <product>" from sysfs for a USB one.
+	Model string `json:"model,omitempty"`
+	// VendorID/ProductID are the USB ids (lower-case hex, no 0x), when sysfs
+	// could be read. Empty inside a container that has the device node passed
+	// through but not /sys.
+	VendorID   string    `json:"vendorId,omitempty"`
+	ProductID  string    `json:"productId,omitempty"`
+	LastSeenAt time.Time `json:"lastSeenAt,omitzero"`
 }
 
 // HeartbeatResponse returns what this device is meant to print on.
@@ -213,12 +269,38 @@ type Printer struct {
 	DPI        int    `json:"dpi"`       // 180 | 203
 	BandHeight int    `json:"bandHeight"`
 	Threshold  int    `json:"threshold"`
+	// LeftMarginDots shifts the printed raster right by this many dots so the
+	// content does not hug the paper's left edge (#1079). 0 — the default and
+	// every pre-S13 server's answer — is byte-identical to the previous build.
+	//
+	// This field must stay a comparable scalar: bridge.samePrinters compares
+	// api.Printer values with ==, and a slice or pointer here would not compile.
+	LeftMarginDots int `json:"leftMarginDots,omitempty"`
+	// CutMode is "full" (the default), "partial" or "none".
+	//
+	// It is per-printer because the cut command is a per-head fact: the owner's
+	// T80C ignores BOTH partial-cut forms (`GS V 66 0`, `GS V 1`, `ESC i`) and
+	// honours `GS V 0` — with the byte counts proving the trailer was sent. An
+	// absent or unrecognised value means "full": a receipt that is not cut is a
+	// receipt the next order prints on top of.
+	CutMode string `json:"cutMode,omitempty"`
 }
+
+// MaxLeftMarginDots bounds the margin. 64 dots is ~8mm at 203dpi — past that a
+// "margin" is a rendering decision the server should make, and on a full-width
+// artifact every dot of margin costs a dot of content off the right edge.
+const MaxLeftMarginDots = 64
 
 // Target renders a Printer as a transport URI the transport package accepts.
 func (p Printer) Target() string {
 	switch p.Transport {
 	case TransportUSB:
+		// The address may already carry the scheme — the discovery sweep
+		// reports "usb:/dev/usb/lp0" and a manager can paste that straight
+		// into the printer form. Don't double it.
+		if strings.HasPrefix(p.Address, "usb:") {
+			return p.Address
+		}
 		return "usb://" + p.Address
 	case TransportTCP:
 		return "tcp://" + p.Address

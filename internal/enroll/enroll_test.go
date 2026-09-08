@@ -16,6 +16,8 @@ import (
 	"github.com/xyz/orderly-print-bridge/internal/api"
 	"github.com/xyz/orderly-print-bridge/internal/api/apitest"
 	"github.com/xyz/orderly-print-bridge/internal/config"
+	"github.com/xyz/orderly-print-bridge/internal/secret"
+	"github.com/xyz/orderly-print-bridge/internal/tailnet"
 )
 
 func TestValidateCode(t *testing.T) {
@@ -404,4 +406,101 @@ func mustFailClaim(t *testing.T, srv *apitest.Server, code string) error {
 		t.Fatal("expected a failure")
 	}
 	return err
+}
+
+// Task 48, the case that is normal until S13 ships (P-17): an enrol response
+// with NO tailscale block. The hook still fires — with an empty Join, so the
+// "no key" line is said once — and nothing else changes.
+func TestRunWithoutATailscaleBlockIsACleanNoOp(t *testing.T) {
+	srv := apitest.New(t)
+	dir := t.TempDir()
+	codePath := filepath.Join(dir, "setup-code")
+	if err := os.WriteFile(codePath, []byte(srv.Code+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var joins []tailnet.Join
+	cfg, err := Run(context.Background(), Options{
+		ServerURL:     srv.URL(),
+		ConfigPath:    filepath.Join(dir, "bridge.json"),
+		SetupCodePath: codePath,
+		Serial:        func() string { return "" },
+		Hostname:      func() (string, error) { return "box-01", nil },
+		OnTailnet:     func(j tailnet.Join) { joins = append(joins, j) },
+	})
+	if err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
+	if !cfg.Enrolled() {
+		t.Fatal("a missing tailscale block must not affect enrolment")
+	}
+	if len(joins) != 1 {
+		t.Fatalf("want the hook called once, got %d", len(joins))
+	}
+	if !joins[0].AuthKey.IsZero() {
+		t.Fatal("there was no key on the wire, so the join must carry none")
+	}
+}
+
+// And the case S13 creates: the key reaches the joiner, and reaches NOTHING
+// else — not the config file, not a log line.
+func TestRunPassesTheTailnetKeyToTheHookAndNeverToDisk(t *testing.T) {
+	const key = "tskey-auth-NOTAREALKEY-0123456789abcdef"
+	srv := apitest.New(t)
+	srv.Tailscale = &api.TailscaleJoin{
+		AuthKey:  secret.Secret(key),
+		Hostname: "orderly-box-7",
+		Tags:     []string{"tag:orderly-box"},
+	}
+	dir := t.TempDir()
+	codePath := filepath.Join(dir, "setup-code")
+	if err := os.WriteFile(codePath, []byte(srv.Code+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(dir, "bridge.json")
+
+	var logged strings.Builder
+	var got tailnet.Join
+	if _, err := Run(context.Background(), Options{
+		ServerURL:     srv.URL(),
+		ConfigPath:    cfgPath,
+		SetupCodePath: codePath,
+		Logf:          func(f string, a ...any) { logged.WriteString(sprintf(f, a...)) },
+		Serial:        func() string { return "" },
+		Hostname:      func() (string, error) { return "box-01", nil },
+		OnTailnet:     func(j tailnet.Join) { got = j },
+	}); err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
+
+	if got.AuthKey.Reveal() != key {
+		t.Fatalf("the joiner got %q, not the minted key", got.AuthKey.Reveal())
+	}
+	if got.Hostname != "orderly-box-7" {
+		t.Fatalf("hostname = %q, want the server's choice", got.Hostname)
+	}
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if strings.Contains(string(raw), key) {
+		t.Fatalf("THE TAILNET KEY WAS WRITTEN TO %s", cfgPath)
+	}
+	if strings.Contains(logged.String(), key) {
+		t.Fatalf("THE TAILNET KEY REACHED A LOG LINE: %s", logged.String())
+	}
+}
+
+// When the server mints a key but names no host, the box names itself after the
+// serial a support engineer can read off the case.
+func TestTailnetHostnameFallback(t *testing.T) {
+	if got := tailnetHostname("HP  t640/ABC 123", "box", "dev_x"); got != "orderly-hp-t640-abc-123" {
+		t.Fatalf("serial fallback = %q", got)
+	}
+	if got := tailnetHostname("", "Kitchen Box.local", "dev_x"); got != "orderly-kitchen-box-local" {
+		t.Fatalf("hostname fallback = %q", got)
+	}
+	if got := tailnetHostname("", "", "dev_abc"); got != "orderly-dev-abc" {
+		t.Fatalf("device-id fallback = %q", got)
+	}
 }

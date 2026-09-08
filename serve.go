@@ -13,7 +13,9 @@ import (
 
 	"github.com/xyz/orderly-print-bridge/internal/bridge"
 	"github.com/xyz/orderly-print-bridge/internal/config"
+	"github.com/xyz/orderly-print-bridge/internal/discover"
 	"github.com/xyz/orderly-print-bridge/internal/enroll"
+	"github.com/xyz/orderly-print-bridge/internal/tailnet"
 	"github.com/xyz/orderly-print-bridge/internal/version"
 )
 
@@ -32,6 +34,13 @@ FLAGS
   --no-local-page      do not fall back to the setup page on 127.0.0.1:47831
   --poll <duration>    poll interval (default 3s)
   --once               run one poll cycle and exit (for smoke tests)
+  --update-check <d>   how often to check for a new release (default 24h, 0 off)
+  --auto-update        install a new release automatically, then restart
+  --unit <name>        systemd unit to restart after an automatic update
+
+SIGNALS
+  SIGUSR1              sweep the LAN + USB for printers right now (POSIX only);
+                       otherwise the sweep runs at most every 10 minutes
 `
 
 const enrollUsage = `orderly-print-bridge enroll — claim a setup code, store the token, exit
@@ -72,7 +81,7 @@ func (c *commonFlags) path() string {
 	return config.DefaultPath()
 }
 
-func (c *commonFlags) enrollOptions(serverURL string) enroll.Options {
+func (c *commonFlags) enrollOptions(serverURL string, onTailnet func(tailnet.Join)) enroll.Options {
 	return enroll.Options{
 		ServerURL:      serverURL,
 		ConfigPath:     c.path(),
@@ -80,7 +89,31 @@ func (c *commonFlags) enrollOptions(serverURL string) enroll.Options {
 		Code:           c.code,
 		AllowLocalPage: !c.noLocalPage,
 		Logf:           logger.Printf,
+		OnTailnet:      onTailnet,
 	}
+}
+
+// joinTailnet runs `tailscale up` with the key the server minted. Every failure
+// is a warning: a box that cannot reach the tailnet must still print (LD-17),
+// and support reachability is not worth a daemon that refuses to start.
+func joinTailnet(ctx context.Context, join tailnet.Join) {
+	j := &tailnet.Joiner{Logf: logger.Printf}
+	if err := j.Up(ctx, join); err != nil {
+		if errors.Is(err, tailnet.ErrNoKey) || errors.Is(err, tailnet.ErrNotInstalled) {
+			// Already said its one line, at the right volume.
+			return
+		}
+		logger.Printf("tailnet join failed (printing is unaffected): %v", err)
+	}
+}
+
+// joinTailnetInBackground is what `serve` uses: enrolment is done, the poll
+// loop must start now, and `tailscale up` can take a minute on a cold uplink.
+// The context is detached deliberately — a join half-run because the parent
+// moved on is a worse state than one that finishes.
+func joinTailnetInBackground(ctx context.Context, join tailnet.Join) {
+	detached := context.WithoutCancel(ctx)
+	go joinTailnet(detached, join)
 }
 
 func runEnroll(args []string) error {
@@ -105,7 +138,11 @@ func runEnroll(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	_, err := enroll.Run(ctx, c.enrollOptions(serverURL))
+	// The one-shot `enroll` command joins SYNCHRONOUSLY: the process is about
+	// to exit, and a backgrounded join would be killed mid-flight.
+	_, err := enroll.Run(ctx, c.enrollOptions(serverURL, func(join tailnet.Join) {
+		joinTailnet(ctx, join)
+	}))
 	return err
 }
 
@@ -116,6 +153,9 @@ func runServe(args []string) error {
 	bindCommon(fs, &c)
 	poll := fs.Duration("poll", bridge.DefaultPollInterval, "poll interval")
 	once := fs.Bool("once", false, "run a single poll cycle and exit")
+	updateEvery := fs.Duration("update-check", 24*time.Hour, "how often to check for a new release (0 disables)")
+	autoUpdate := fs.Bool("auto-update", false, "install a new release automatically and restart")
+	unit := fs.String("unit", DefaultServiceUnit, "systemd unit to restart after an automatic update")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -137,6 +177,12 @@ func runServe(args []string) error {
 	if *once {
 		return b.Tick(ctx)
 	}
+
+	// `systemctl kill -s USR1 orderly-bridge` = sweep for printers now.
+	onDemandSweep(ctx, b, logger.Printf)
+	// Every ~24 h: say whether a new release exists (and with --auto-update,
+	// install it). The install path of record is still the nightly timer.
+	watchForUpdates(ctx, *updateEvery, *autoUpdate, *unit)
 
 	err = b.Run(ctx)
 	switch {
@@ -185,7 +231,9 @@ func loadOrEnroll(ctx context.Context, c *commonFlags) (*config.Config, error) {
 	// first boot, and a dead container is a box that never prints.
 	backoff := 5 * time.Second
 	for attempt := 1; ; attempt++ {
-		enrolled, err := enroll.Run(ctx, c.enrollOptions(serverURL))
+		enrolled, err := enroll.Run(ctx, c.enrollOptions(serverURL, func(join tailnet.Join) {
+			joinTailnetInBackground(ctx, join)
+		}))
 		if err == nil {
 			return enrolled, nil
 		}
@@ -216,4 +264,55 @@ func loadOrEnroll(ctx context.Context, c *commonFlags) (*config.Config, error) {
 			backoff *= 2
 		}
 	}
+}
+
+const discoverUsage = `orderly-print-bridge discover — list the printers this machine can see
+
+  Probes this box's own /24 for TCP 9100 and asks each responder for its ESC/POS
+  identity, then lists the Linux USB printer nodes (/dev/usb/lp*). It prints
+  what it found and exits.
+
+  This is a LOOK, never a routing decision: the daemon prints only to the
+  printer Orderly assigned it. Paste an address below into Orderly's printer
+  form to make it one.
+`
+
+// runDiscover is the operator's copy of the daemon's sweep — the answer to
+// "what is the printer's address?" without a subnet scanner on a venue's PC.
+func runDiscover(args []string) error {
+	fs := flag.NewFlagSet("discover", flag.ContinueOnError)
+	fs.Usage = func() { fmt.Fprint(os.Stderr, discoverUsage) }
+	quiet := fs.Bool("quiet", false, "print only the addresses, one per line")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	opts := discover.Options{}
+	if !*quiet {
+		opts.Logf = logger.Printf
+	}
+	found, err := discover.Sweep(ctx, opts)
+	if err != nil {
+		return err
+	}
+	if len(found) == 0 {
+		fmt.Println("No printers answered on this network, and no USB printer nodes are present.")
+		fmt.Println("Check the printer is powered on, on this LAN (or plugged in), and that raw printing (port 9100) is enabled.")
+		return nil
+	}
+	for _, c := range found {
+		if *quiet {
+			fmt.Println(c.Address)
+			continue
+		}
+		label := c.Model
+		if label == "" {
+			label = "unidentified — answered on 9100 but did not say what it is"
+		}
+		fmt.Printf("%-28s  %-4s  %s\n", c.Address, c.Transport, label)
+	}
+	return nil
 }

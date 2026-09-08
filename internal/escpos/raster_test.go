@@ -34,8 +34,10 @@ func TestEncodeEmitsInitAndCut(t *testing.T) {
 	if !bytes.Contains(out, []byte{0x1d, 0x76, 0x30, 0x00}) {
 		t.Error("stream should contain a GS v 0 raster command")
 	}
-	if !bytes.Contains(out, []byte{0x1d, 0x56, 0x42, 0x00}) {
-		t.Error("stream should end with a partial cut GS V 66 0 by default")
+	// Changed 2026-09-08: the default trailer is a full cut, GS V 0. The
+	// owner's T80C ignores BOTH partial-cut forms; see the CutMode doc.
+	if !bytes.HasSuffix(out, []byte{0x1d, 0x56, 0x00}) {
+		t.Error("stream should end with a full cut GS V 0 by default")
 	}
 }
 

@@ -28,6 +28,7 @@ import (
 	"github.com/xyz/orderly-print-bridge/internal/api"
 	"github.com/xyz/orderly-print-bridge/internal/config"
 	"github.com/xyz/orderly-print-bridge/internal/secret"
+	"github.com/xyz/orderly-print-bridge/internal/tailnet"
 )
 
 // LocalPageAddr is the loopback address of the last-resort code page.
@@ -147,6 +148,19 @@ type Options struct {
 	Hostname func() (string, error)
 	// HTTPClient lets a caller supply a pre-configured api client (tests).
 	Client *api.Client
+	// OnTailnet, when set, receives the tailnet join block from the enrol
+	// response AFTER the config is safely on disk (master-plan task 48).
+	//
+	// It is a callback rather than a return value for one reason: the key is
+	// consumed HERE and never written to disk (LD-17), and the caller decides
+	// whether joining blocks it (the one-shot `enroll` command, which would
+	// otherwise exit before tailscale finished) or runs beside the poll loop
+	// (`serve`, which must never wait on Tailscale to start printing).
+	//
+	// It is called even when the response carried NO block — the normal case
+	// against any server older than S13 — so the "no tailnet key" line is said
+	// exactly once, by one owner.
+	OnTailnet func(tailnet.Join)
 }
 
 func (o *Options) logf(format string, args ...any) {
@@ -219,7 +233,58 @@ func Run(ctx context.Context, opts Options) (*config.Config, error) {
 	}
 	// Never the token — the device id is the thing an operator quotes.
 	opts.logf("enrolled as device %s (venue %s); token stored at %s", cfg.DeviceID, cfg.VenueID, cfg.Path())
+
+	// The tailnet key, if the server minted one. It is handed straight to the
+	// callback and goes out of scope here: it is in no config field, no log
+	// line and nothing that gets marshalled (task 48, LD-31).
+	if opts.OnTailnet != nil {
+		var join tailnet.Join
+		if resp.Tailscale != nil {
+			join = tailnet.Join{
+				AuthKey:     resp.Tailscale.AuthKey,
+				Hostname:    firstNonEmpty(resp.Tailscale.Hostname, tailnetHostname(serial, host, resp.DeviceID)),
+				Tags:        resp.Tailscale.Tags,
+				LoginServer: resp.Tailscale.LoginServer,
+			}
+		}
+		opts.OnTailnet(join)
+	}
 	return cfg, nil
+}
+
+// tailnetHostname is the fallback name a box takes on the tailnet when the
+// server did not choose one: the hardware serial (what a support engineer reads
+// off the case), else the hostname, else the device id. Lower-cased and
+// stripped to what Tailscale accepts in a machine name.
+func tailnetHostname(serial, host, deviceID string) string {
+	for _, candidate := range []string{serial, host, deviceID} {
+		if name := sanitizeHostname(candidate); name != "" {
+			return "orderly-" + name
+		}
+	}
+	return ""
+}
+
+func sanitizeHostname(s string) string {
+	var b strings.Builder
+	// Anything that is not a letter or a digit becomes a single hyphen: a DMI
+	// serial can carry slashes, spaces and dots, and Tailscale accepts only
+	// [a-z0-9-] in a machine name.
+	for _, r := range strings.ToLower(strings.TrimSpace(s)) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		default:
+			if b.Len() > 0 && !strings.HasSuffix(b.String(), "-") {
+				b.WriteRune('-')
+			}
+		}
+	}
+	name := strings.Trim(b.String(), "-")
+	if len(name) > 40 {
+		name = strings.Trim(name[:40], "-")
+	}
+	return name
 }
 
 func resolveCode(ctx context.Context, opts *Options, codePath string) (string, error) {
