@@ -161,7 +161,9 @@ func openDeviceWithTimeout(path string, timeout time.Duration) (*os.File, error)
 	}
 	ch := make(chan opened, 1)
 	go func() {
-		f, err := os.OpenFile(path, os.O_WRONLY, 0)
+		// Blocking on purpose — see openBlocking (open_unix.go) for the cut
+		// that a non-blocking descriptor loses.
+		f, err := openBlocking(path)
 		ch <- opened{f, err}
 	}()
 	select {
