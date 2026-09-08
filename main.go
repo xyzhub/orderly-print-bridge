@@ -49,7 +49,9 @@ FLAGS
   --center            center the image on the paper
   --left-margin <n>   shift the raster right by n dots inside the paper width
                       (0-64; the rightmost n dots of the image are dropped)
-  --full-cut          full cut (GS V 0) instead of partial cut (GS V 66 0)
+  --full-cut          legacy alias for --cut-mode full
+  --cut-mode <mode>   full (default, GS V 0) | partial (GS V 66 0) | none (feed
+                      only — for a head with no cutter)
   --decode  <path>    decode an ESC/POS file back to PNG (writes to --out)
 `
 
@@ -101,7 +103,8 @@ func runPrint(args []string) error {
 		dither     = fs.Bool("dither", false, "Floyd-Steinberg dither instead of threshold")
 		threshold  = fs.Int("threshold", 128, "grey cutoff (0-255) for black when not dithering")
 		center     = fs.Bool("center", false, "center the image on the paper")
-		fullCut    = fs.Bool("full-cut", false, "full cut instead of partial cut")
+		fullCut    = fs.Bool("full-cut", false, "legacy alias for --cut-mode full")
+		cutMode    = fs.String("cut-mode", "", "how to end the receipt: full (default) | partial | none")
 		decode     = fs.String("decode", "", "decode an ESC/POS file back to PNG (writes to --out)")
 		leftMargin = fs.Int("left-margin", 0, "shift the raster right by N dots inside the paper width (0-64)")
 	)
@@ -127,6 +130,11 @@ func runPrint(args []string) error {
 	if *leftMargin < 0 || *leftMargin > escpos.MaxLeftMarginDots {
 		return fmt.Errorf("--left-margin must be 0-%d dots, got %d", escpos.MaxLeftMarginDots, *leftMargin)
 	}
+	switch *cutMode {
+	case "", escpos.CutFull, escpos.CutPartial, escpos.CutNone:
+	default:
+		return fmt.Errorf("--cut-mode must be full, partial or none, got %q", *cutMode)
+	}
 
 	img, err := loadImage(*imagePath)
 	if err != nil {
@@ -139,6 +147,7 @@ func runPrint(args []string) error {
 		Threshold:      uint8(*threshold),
 		Center:         *center,
 		FullCut:        *fullCut,
+		CutMode:        *cutMode,
 		BandHeight:     128,
 		LeftMarginDots: *leftMargin,
 	}

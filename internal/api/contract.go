@@ -52,6 +52,7 @@
 //   - `EnrollResponse.Tailscale` — the minted tailnet join (LD-31). Absent ⇒
 //     one log line, no join, printing unaffected.
 //   - `Printer.LeftMarginDots` — #1079. Absent ⇒ 0 ⇒ byte-identical output.
+//   - `Printer.CutMode` — the 2026-09-08 T80C cut finding. Absent ⇒ "full".
 //   - `HeartbeatRequest.Discovered` — the sweep payload. The shipped handler
 //     already accepts and drops it, so sending it is safe today.
 //
@@ -275,6 +276,14 @@ type Printer struct {
 	// This field must stay a comparable scalar: bridge.samePrinters compares
 	// api.Printer values with ==, and a slice or pointer here would not compile.
 	LeftMarginDots int `json:"leftMarginDots,omitempty"`
+	// CutMode is "full" (the default), "partial" or "none".
+	//
+	// It is per-printer because the cut command is a per-head fact: the owner's
+	// T80C ignores BOTH partial-cut forms (`GS V 66 0`, `GS V 1`, `ESC i`) and
+	// honours `GS V 0` — with the byte counts proving the trailer was sent. An
+	// absent or unrecognised value means "full": a receipt that is not cut is a
+	// receipt the next order prints on top of.
+	CutMode string `json:"cutMode,omitempty"`
 }
 
 // MaxLeftMarginDots bounds the margin. 64 dots is ~8mm at 203dpi — past that a

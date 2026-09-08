@@ -25,6 +25,30 @@ var (
 	cmdFullCut  = []byte{0x1d, 0x56, 0x00}       // GS V 0     full cut
 )
 
+// Cut modes for Options.CutMode.
+//
+// Observed on the owner's T80C over USB, 2026-09-08: the head IGNORES BOTH
+// partial-cut forms (`GS V 66 0` — this package's original hard-coded trailer —
+// and `GS V 1`, and `ESC i`) while honouring `GS V 0`. The byte counts proved
+// the trailer was sent, so this is the printer's behaviour, not a lost write. A
+// cut command is therefore a PER-PRINTER FACT, not a constant, and the default
+// is now the form that was seen to work.
+//
+// `GS V 65 3` cuts on that head too, but it feeds three extra units first and
+// the owner read the result as wasted paper (2026-09-08 15:37) — the 4-LF feed
+// this package already emits is enough to clear the head.
+const (
+	// CutFull emits the existing feed followed by GS V 0. The DEFAULT.
+	CutFull = "full"
+	// CutPartial emits GS V 66 0 (the pre-2026-09-08 behaviour). Keep it for
+	// heads that leave the receipt hanging by a tab, which many venues prefer.
+	CutPartial = "partial"
+	// CutNone emits no cut command at all — for a head with no cutter, or one
+	// with a tear bar, where a cut command is at best ignored and at worst an
+	// error beep.
+	CutNone = "none"
+)
+
 // CmdIdentity is the ESC/POS identity query `GS I 1` (transmit printer model
 // ID). It is how a candidate on port 9100 is asked to prove it is a thermal
 // printer before a welcome slip is sent to it — an office LaserJet answers
@@ -48,7 +72,14 @@ type Options struct {
 	Threshold uint8
 	// Center emits ESC a 1 so the image is centered on the paper.
 	Center bool
-	// FullCut emits GS V 0 (full cut) instead of GS V 66 0 (partial cut).
+	// CutMode is "full" (default), "partial" or "none" — see the constants
+	// above. An unknown or empty value means "full": a printer profile that
+	// arrives from a future server with a mode this build does not know must
+	// still cut the paper.
+	CutMode string
+	// FullCut is the CLI's legacy `--full-cut`: it emits the bare GS V 0. It
+	// applies only when CutMode is empty, so a server-supplied mode always
+	// wins. Kept because the paper tests are driven by that flag.
 	FullCut bool
 	// NoResample rejects, instead of rescaling, a source image whose width is
 	// not already Width. The server renders the artifact at the printer's
@@ -164,12 +195,26 @@ func Encode(src image.Image, opts Options) ([]byte, error) {
 	}
 
 	buf.Write(cmdFeed)
-	if opts.FullCut {
-		buf.Write(cmdFullCut)
-	} else {
-		buf.Write(cmdPartCut)
-	}
+	buf.Write(cutCommand(opts))
 	return buf.Bytes(), nil
+}
+
+// cutCommand picks the trailer. Order matters: an explicit CutMode from the
+// server beats the CLI's legacy boolean, and anything unrecognised falls back to
+// a full cut rather than to no cut — an uncut receipt is a receipt the next
+// order prints on top of.
+func cutCommand(opts Options) []byte {
+	switch opts.CutMode {
+	case CutPartial:
+		return cmdPartCut
+	case CutNone:
+		// Feed only. The feed is written by the caller, so a tear-bar head
+		// still advances the receipt clear of the mechanism.
+		return nil
+	}
+	// "full", the legacy --full-cut boolean, an empty mode and anything a
+	// future server invents all land here: cut the paper.
+	return cmdFullCut
 }
 
 // writeRasterCommand emits one GS v 0 command for rows [y0, y0+rows) of mono.

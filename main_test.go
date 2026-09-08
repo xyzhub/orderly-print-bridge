@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"image"
 	"image/color"
 	_ "image/png"
@@ -129,5 +130,38 @@ func TestCLILeftMarginShiftsWithoutWidening(t *testing.T) {
 	}
 	if err := runPrint([]string{"--image", "sample/receipt.png", "--left-margin", "999", "--out", sink}); err == nil {
 		t.Fatal("a margin past the cap must be refused, not silently clamped at the CLI")
+	}
+}
+
+// The cut trailer is what the owner's T80C finding turned into a setting: a
+// receipt that is not cut is a receipt the next order prints on top of.
+func TestCLICutModes(t *testing.T) {
+	dir := t.TempDir()
+	trailer := func(args ...string) []byte {
+		t.Helper()
+		sink := filepath.Join(dir, "cut.escpos")
+		if err := runPrint(append([]string{"--image", "sample/receipt.png", "--width", "384", "--out", sink}, args...)); err != nil {
+			t.Fatalf("print %v: %v", args, err)
+		}
+		raw, err := os.ReadFile(sink)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw[len(raw)-8:]
+	}
+	if got := trailer(); !bytes.HasSuffix(got, []byte{0x1d, 0x56, 0x00}) {
+		t.Fatalf("default trailer % x, want a full cut GS V 0", got)
+	}
+	if got := trailer("--cut-mode", "partial"); !bytes.HasSuffix(got, []byte{0x1d, 0x56, 0x42, 0x00}) {
+		t.Fatalf("partial trailer % x", got)
+	}
+	if got := trailer("--cut-mode", "none"); !bytes.HasSuffix(got, []byte{0x0a, 0x0a, 0x0a, 0x0a}) {
+		t.Fatalf("none trailer % x, want the feed alone", got)
+	}
+	if got := trailer("--full-cut"); !bytes.HasSuffix(got, []byte{0x1d, 0x56, 0x00}) {
+		t.Fatalf("--full-cut trailer % x", got)
+	}
+	if err := runPrint([]string{"--image", "sample/receipt.png", "--cut-mode", "sideways", "--out", filepath.Join(dir, "x")}); err == nil {
+		t.Fatal("an unknown --cut-mode must be refused at the CLI")
 	}
 }

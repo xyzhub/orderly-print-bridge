@@ -439,6 +439,9 @@ func (b *Bridge) execute(ctx context.Context, job *api.Job, printer api.Printer)
 		BandHeight:     bandOrDefault(printer.BandHeight),
 		NoResample:     true,
 		LeftMarginDots: printer.LeftMarginDots,
+		// Empty (every server before this field existed) means a full cut,
+		// which is what the bench proved this head honours.
+		CutMode: printer.CutMode,
 	}
 	if printer.LeftMarginDots > 0 {
 		// Say it on every print, because it is a per-printer server setting a

@@ -1,6 +1,7 @@
 package escpos
 
 import (
+	"bytes"
 	"image"
 	"image/color"
 	"testing"
@@ -92,4 +93,41 @@ func TestMarginIsClamped(t *testing.T) {
 
 func isInk(img image.Image, x, y int) bool {
 	return color.GrayModel.Convert(img.At(x, y)).(color.Gray).Y < 128
+}
+
+// The exact trailer per cut mode (owner's T80C finding, 2026-09-08). The bytes
+// are the contract: this head ignores both partial-cut forms, so a venue whose
+// receipts stopped being cut is a venue on the wrong mode.
+func TestCutModeTrailerBytes(t *testing.T) {
+	feed := []byte{0x0a, 0x0a, 0x0a, 0x0a}
+	cases := []struct {
+		mode    string
+		fullCut bool
+		want    []byte
+	}{
+		{mode: "", want: append(append([]byte{}, feed...), 0x1d, 0x56, 0x00)},               // default = full
+		{mode: CutFull, want: append(append([]byte{}, feed...), 0x1d, 0x56, 0x00)},          // GS V 0
+		{mode: CutPartial, want: append(append([]byte{}, feed...), 0x1d, 0x56, 0x42, 0x00)}, // GS V 66 0
+		{mode: CutNone, want: feed}, // feed only
+		{mode: "", fullCut: true, want: append(append([]byte{}, feed...), 0x1d, 0x56, 0x00)}, // legacy --full-cut
+		{mode: "sideways", want: append(append([]byte{}, feed...), 0x1d, 0x56, 0x00)},        // unknown = cut anyway
+	}
+	for _, tc := range cases {
+		opts := DefaultOptions()
+		opts.Width = 64
+		opts.NoResample = true
+		opts.CutMode = tc.mode
+		opts.FullCut = tc.fullCut
+		out, err := Encode(blackImage(64, 8), opts)
+		if err != nil {
+			t.Fatalf("cutMode %q: %v", tc.mode, err)
+		}
+		if !bytes.HasSuffix(out, tc.want) {
+			t.Fatalf("cutMode %q (fullCut=%t): trailer is % x, want it to end % x",
+				tc.mode, tc.fullCut, out[len(out)-8:], tc.want)
+		}
+		if tc.mode == CutNone && bytes.Contains(out, []byte{0x1d, 0x56}) {
+			t.Fatalf("cutMode none emitted a GS V cut command")
+		}
+	}
 }

@@ -237,7 +237,8 @@ open roundtrip.png
 | `--dither` | off | Floyd-Steinberg dither instead of a hard threshold |
 | `--threshold <0-255>` | `128` | grey cutoff for black (only when not dithering) |
 | `--center` | off | center the image on the paper |
-| `--full-cut` | off | full cut (`GS V 0`) instead of partial cut (`GS V 66 0`) |
+| `--full-cut` | off | legacy alias for `--cut-mode full` |
+| `--cut-mode <mode>` | `full` | `full` (`GS V 0`) · `partial` (`GS V 66 0`) · `none` (feed only) |
 | `--left-margin <n>` | `0` | shift the raster right by *n* dots inside the paper width (0–64) |
 | `--decode <path>` | — | decode an ESC/POS file back to a PNG (writes to `--out`) |
 
@@ -376,6 +377,16 @@ see in `--decode`. Verify a margin without paper:
 orderly-print-bridge --image sample/receipt.png --width 512 --left-margin 24 --out m.escpos
 orderly-print-bridge --decode m.escpos --out m.png   # still 512 wide, 24 blank columns
 ```
+
+### The cut (`cutMode`)
+
+A per-printer setting: **`full`** (the default — the 4-LF feed then `GS V 0`),
+`partial` (`GS V 66 0`, the pre-2026-09-08 behaviour), or `none` (feed only, for
+a head with no cutter or a tear bar). An absent or unrecognised value means
+`full`, because a receipt that is not cut is a receipt the next order prints on
+top of. The cut command is a **per-head fact**: the owner's T80C over USB
+ignores both partial-cut forms (`GS V 66 0`, `GS V 1`, `ESC i`) while honouring
+`GS V 0`, with the byte counts proving the trailer was sent.
 
 ### The tailnet join
 
