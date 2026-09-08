@@ -4,6 +4,7 @@ package transport
 
 import (
 	"os"
+	"runtime"
 	"syscall"
 )
 
@@ -28,8 +29,21 @@ func openBlocking(path string) (*os.File, error) {
 	if err != nil {
 		return nil, &os.PathError{Op: "open", Path: path, Err: err}
 	}
+	// The trade-off of a blocking write: a printer that is out of paper or has
+	// its cover open would hold write() open until someone reloads it, past
+	// the daemon's 60 s job budget, and the job would then print anyway when
+	// the lid closes. usblp's LPABORT switch makes it return ENOSPC on a paper
+	// error instead, so the write fails fast, the job is retried later, and
+	// close() has nothing dangling. Linux-only ioctl (lp.h LPABORT = 0x0604,
+	// arg 1 = abort on error); harmless to skip elsewhere or on a plain file.
+	if runtime.GOOS == "linux" {
+		_, _, _ = syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), lpAbort, 1)
+	}
 	return os.NewFile(uintptr(fd), path), nil
 }
+
+// lpAbort is LPABORT from <linux/lp.h>: 0x0604.
+const lpAbort = 0x0604
 
 // isNonBlocking reports whether fd carries O_NONBLOCK — the test's probe.
 func isNonBlocking(f *os.File) (bool, error) {
