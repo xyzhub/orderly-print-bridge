@@ -17,6 +17,7 @@ import (
 	"github.com/xyz/orderly-print-bridge/internal/api"
 	"github.com/xyz/orderly-print-bridge/internal/api/apitest"
 	"github.com/xyz/orderly-print-bridge/internal/config"
+	"github.com/xyz/orderly-print-bridge/internal/discover"
 	"github.com/xyz/orderly-print-bridge/internal/escpos"
 	"github.com/xyz/orderly-print-bridge/internal/secret"
 	"github.com/xyz/orderly-print-bridge/internal/transport"
@@ -498,22 +499,187 @@ func TestAcksUseTheServersVocabularyAndDropTheAlias(t *testing.T) {
 	}
 }
 
-// A revoked device stops polling instead of hammering the rate limiter.
-func TestRevokedTokenStopsTheLoop(t *testing.T) {
+// A revoked device stops POLLING — one 401 per cycle is what fills a rate
+// limiter — but the poll cycle still names the failure as ErrRevoked so the
+// loop (and `--once`) can tell auth from a flaky uplink.
+func TestRevokedTokenStopsThePollCycle(t *testing.T) {
 	srv := apitest.New(t)
 	printer, _ := fileSink(t, 512)
 	b := newBridge(t, srv, printer)
 	b.Client = api.New(srv.URL(), secret.Secret("odb_wrong_token"))
 	b.HeartbeatInterval = time.Nanosecond
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	err := b.Run(ctx)
+	err := b.Tick(context.Background())
 	if !errors.Is(err, ErrRevoked) {
 		t.Fatalf("want ErrRevoked, got %v", err)
 	}
 	if !strings.Contains(err.Error(), "revoked") {
 		t.Fatalf("the operator word must be in the message: %v", err)
+	}
+	if polls, _, _ := srv.Counts(); polls != 0 {
+		t.Fatalf("a rejected heartbeat must not be followed by a poll, got %d", polls)
+	}
+}
+
+// Issue #9, the whole fix. A rejected token must NOT exit: exiting handed the
+// box to systemd's `Restart=always RestartSec=5`, which produced 260 restarts
+// and 560 rejected heartbeats in three hours and then a 429 lockout.
+//
+// The contract this pins: the process stays in Run; exactly ONE auth attempt
+// per backoff step; the steps are 1 → 2 → 5 → 10 → 10 … minutes (±10 %); and
+// a fresh bridge.json written by ANOTHER process (`enroll`) is picked up on
+// the next step, with polling resuming and no restart.
+func TestRevokedTokenBacksOffInPlaceAndResumesOnAReEnrolment(t *testing.T) {
+	srv := apitest.New(t)
+	b := newBridge(t, srv)
+	b.Cfg.Token = secret.Secret("odb_stale_token")
+	b.Client = api.New(srv.URL(), b.Cfg.Token)
+	if err := b.Cfg.Save(); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+
+	// The step at which the operator resets the box in Orderly and re-enrols.
+	const reEnrolAt = 6
+	var waits []time.Duration
+	b.Wait = func(_ context.Context, d time.Duration) error {
+		waits = append(waits, d)
+		if len(waits) == reEnrolAt {
+			fresh := &config.Config{
+				ServerURL: srv.URL(),
+				Token:     secret.Secret(srv.Token),
+				DeviceID:  srv.DeviceID,
+				VenueID:   srv.VenueID,
+			}
+			fresh.SetPath(b.Cfg.Path())
+			if err := fresh.Save(); err != nil {
+				t.Errorf("write the re-enrolled config: %v", err)
+			}
+		}
+		return nil // the schedule is asserted, not slept through
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- b.Run(ctx) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if polls, _, _ := srv.Counts(); polls > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			<-done
+			t.Fatalf("the daemon never resumed polling after the re-enrolment (waits so far: %v)", waits)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	cancel()
+	err := <-done
+
+	if errors.Is(err, ErrRevoked) {
+		t.Fatalf("Run returned ErrRevoked — that is the exit that caused the restart loop")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run must only end on its context, got %v", err)
+	}
+	if len(waits) != reEnrolAt {
+		t.Fatalf("want %d backoff steps before the resume, got %d: %v", reEnrolAt, len(waits), waits)
+	}
+	want := []time.Duration{time.Minute, 2 * time.Minute, 5 * time.Minute, 10 * time.Minute, 10 * time.Minute, 10 * time.Minute}
+	for i, got := range waits {
+		lo := time.Duration(float64(want[i]) * (1 - RevokedBackoffJitter))
+		hi := time.Duration(float64(want[i]) * (1 + RevokedBackoffJitter))
+		if got < lo || got > hi {
+			t.Errorf("backoff step %d = %s, want %s ±10%% (%s…%s)", i, got, want[i], lo, hi)
+		}
+	}
+	// One rejected heartbeat for the first poll cycle, then exactly one per
+	// backoff step until the re-enrolled token worked.
+	if got := srv.Rejections(); got != reEnrolAt {
+		t.Errorf("the server saw %d rejected calls for %d backoff steps; want one auth attempt per step",
+			got, reEnrolAt)
+	}
+	if b.Cfg.Token.Reveal() != srv.Token {
+		t.Errorf("the re-enrolled token on disk was not adopted")
+	}
+}
+
+// Nothing on disk means nothing to adopt: a backoff step must not clear a
+// working identity because the file went missing or was half-written.
+func TestReloadConfigOnlyAdoptsAUsableNewIdentity(t *testing.T) {
+	srv := apitest.New(t)
+	b := newBridge(t, srv)
+	original := b.Cfg
+
+	if b.reloadConfig() {
+		t.Error("adopted a config that is not on disk")
+	}
+	if err := os.WriteFile(b.Cfg.Path(), []byte("{ not json"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if b.reloadConfig() {
+		t.Error("adopted an unparseable config")
+	}
+	unenrolled := &config.Config{ServerURL: srv.URL()}
+	unenrolled.SetPath(b.Cfg.Path())
+	if err := unenrolled.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if b.reloadConfig() {
+		t.Error("adopted a config with no token")
+	}
+	if b.Cfg != original {
+		t.Fatal("the in-memory identity was replaced by an unusable one")
+	}
+}
+
+// Setup mode (S7): a box with no printer assigned sweeps every 60 s for its
+// first 15 minutes, so an installer sees the printer they just plugged in
+// without waiting out the 10-minute interval — and a box that already prints
+// never scans a venue's /24 once a minute.
+func TestSetupModeSweepInterval(t *testing.T) {
+	base := time.Date(2026, 9, 22, 9, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name       string
+		printers   int
+		sinceStart time.Duration
+		sinceSweep time.Duration
+		wantSweep  bool
+	}{
+		{"setup mode sweeps after 60s", 0, 2 * time.Minute, 61 * time.Second, true},
+		{"setup mode waits below 60s", 0, 2 * time.Minute, 30 * time.Second, false},
+		{"a printer is assigned: 90s is too soon", 1, 2 * time.Minute, 90 * time.Second, false},
+		{"a printer is assigned: 11min is due", 1, 2 * time.Minute, 11 * time.Minute, true},
+		{"past the setup window: 90s is too soon", 0, 20 * time.Minute, 90 * time.Second, false},
+		{"past the setup window: 11min is due", 0, 20 * time.Minute, 11 * time.Minute, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := apitest.New(t)
+			b := newBridge(t, srv)
+			now := base.Add(tc.sinceStart)
+			b.Now = func() time.Time { return now }
+			b.SweepInterval = discover.SweepInterval
+			b.Discover = func(context.Context) ([]api.DiscoveredPrinter, error) { return nil, nil }
+			b.defaults()
+			b.mu.Lock()
+			b.startedAt = base
+			b.printersAssigned = tc.printers
+			b.lastSweep = now.Add(-tc.sinceSweep)
+			previous := b.lastSweep
+			b.mu.Unlock()
+
+			b.startSweep(context.Background(), false)
+
+			b.mu.Lock()
+			swept := !b.lastSweep.Equal(previous)
+			b.mu.Unlock()
+			if swept != tc.wantSweep {
+				t.Fatalf("sweep ran = %v, want %v (%d printer(s), %s since start, %s since the last sweep)",
+					swept, tc.wantSweep, tc.printers, tc.sinceStart, tc.sinceSweep)
+			}
+		})
 	}
 }
 
