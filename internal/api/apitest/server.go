@@ -59,6 +59,10 @@ type Server struct {
 	pollCount   int
 	artifactHit map[string]int
 	enrollCount int
+	// rejections counts authenticated calls refused with 401. It is what
+	// issue #9 is measured in: one revoked box produced 560 of these
+	// overnight before the server's limiter locked it out.
+	rejections int
 	// ArtifactStatus, when set for a job id, is returned instead of the bytes.
 	ArtifactStatus map[string]int
 }
@@ -162,12 +166,24 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 func (s *Server) authed(w http.ResponseWriter, r *http.Request, next func(http.ResponseWriter, *http.Request)) {
 	s.mu.Lock()
 	want := "Bearer " + s.Token
+	ok := r.Header.Get("Authorization") == want
+	if !ok {
+		s.rejections++
+	}
 	s.mu.Unlock()
-	if r.Header.Get("Authorization") != want {
+	if !ok {
 		fail(w, http.StatusUnauthorized, api.CodeDeviceRevoked)
 		return
 	}
 	next(w, r)
+}
+
+// Rejections is how many authenticated calls were refused with 401 — the
+// number a backoff is supposed to keep small.
+func (s *Server) Rejections() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rejections
 }
 
 func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {

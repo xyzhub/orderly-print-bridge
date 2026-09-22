@@ -46,6 +46,51 @@ const PathEnv = "ORDERLY_BRIDGE_CONFIG"
 // on a box (LD-10). Kept here so config and enroll agree on one string.
 const SetupCodePathLinux = "/etc/orderly/setup-code"
 
+// ServerURLFileName is the PRE-ENROLMENT server hint the installer writes
+// beside the config file (`/etc/orderly/server-url` on a box), next to the
+// setup code it already writes there.
+//
+// It exists so the systemd unit can be a bare `serve` with no `--server`: a
+// flag in the unit outlives the install that wrote it, and on 2026-09-21 a unit
+// carrying the default production URL silently re-pointed a box enrolled to
+// staging on its first reboot (issue #10). The file is read ONLY when this
+// device holds no token; once enrolled, bridge.json is the truth and nothing
+// on disk may move the box.
+const ServerURLFileName = "server-url"
+
+// ServerURLPath is where that hint lives for a given config path — always the
+// config file's own directory, so an `ORDERLY_BRIDGE_CONFIG` or `--config`
+// override keeps the pair together.
+func ServerURLPath(configPath string) string {
+	if strings.TrimSpace(configPath) == "" {
+		configPath = DefaultPath()
+	}
+	return filepath.Join(filepath.Dir(configPath), ServerURLFileName)
+}
+
+// ReadServerURL returns the pre-enrolment server hint at path.
+//
+// A missing file wraps os.ErrNotExist, so a caller can tell "no hint" (the
+// normal state of a hand-built box) from "a hint that is not usable". Anything
+// that is not a single http(s) URL is rejected rather than half-read: this
+// value decides which Orderly a setup code is presented to.
+func ReadServerURL(path string) (string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("config: read %s: %w", path, err)
+	}
+	url := strings.TrimRight(strings.TrimSpace(string(raw)), "/")
+	switch {
+	case url == "":
+		return "", fmt.Errorf("config: %s is empty", path)
+	case strings.ContainsAny(url, " \t\r\n"):
+		return "", fmt.Errorf("config: %s does not hold a single URL", path)
+	case !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://"):
+		return "", fmt.Errorf("config: %s does not hold an http(s) URL", path)
+	}
+	return url, nil
+}
+
 // ErrNotFound is returned by Load when no config file exists yet — the normal
 // state of a freshly flashed box, not an error condition.
 var ErrNotFound = errors.New("config: no config file (not enrolled yet)")

@@ -225,3 +225,62 @@ func TestSecureOnWindowsSurfacesAFailure(t *testing.T) {
 		t.Fatal("an ACL that could not be applied must be an error, not a shrug")
 	}
 }
+
+// The pre-enrolment hint lives beside the config file, on every OS and under
+// every --config / ORDERLY_BRIDGE_CONFIG override: the installer writes the
+// pair into one directory, and a test that moves one must move both.
+func TestServerURLPathSitsBesideTheConfig(t *testing.T) {
+	if got, want := ServerURLPath("/etc/orderly/bridge.json"), "/etc/orderly/server-url"; got != want {
+		t.Errorf("ServerURLPath = %q, want %q", got, want)
+	}
+	dir := t.TempDir()
+	if got, want := ServerURLPath(filepath.Join(dir, FileName)), filepath.Join(dir, ServerURLFileName); got != want {
+		t.Errorf("ServerURLPath = %q, want %q", got, want)
+	}
+}
+
+func TestReadServerURL(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		want    string
+		wantErr bool
+	}{
+		{name: "a plain URL", body: "https://orderly.now\n", want: "https://orderly.now"},
+		{name: "trailing slash and blanks are trimmed", body: "  https://orderly-staging.fly.dev/  \n", want: "https://orderly-staging.fly.dev"},
+		{name: "http is allowed (a LAN install)", body: "http://192.168.1.10:3000", want: "http://192.168.1.10:3000"},
+		{name: "empty is not a URL", body: "\n\n", wantErr: true},
+		{name: "a bare host is not a URL", body: "orderly.example\n", wantErr: true},
+		{name: "two lines are not one URL", body: "https://a.example\nhttps://b.example\n", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), ServerURLFileName)
+			if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			got, err := ReadServerURL(path)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("want an error, got %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ReadServerURL: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("ReadServerURL = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// A missing hint is the normal state of a hand-built box, and the caller must
+// be able to tell it from an unusable one.
+func TestReadServerURLMissingWrapsNotExist(t *testing.T) {
+	_, err := ReadServerURL(filepath.Join(t.TempDir(), ServerURLFileName))
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a missing file must wrap os.ErrNotExist, got %v", err)
+	}
+}

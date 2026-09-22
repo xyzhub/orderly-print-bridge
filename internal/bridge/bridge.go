@@ -18,8 +18,13 @@
 //     and the first answer can be an office LaserJet (counsel finding 6).
 //   - Every job is acked within 60 s or acked `failed{timeout}`. The server's
 //     lease reclaim runs at 2 minutes, so a silent daemon is not a stuck job.
-//   - A 401 stops the loop: the device was revoked, and a revoked device that
-//     keeps polling is just noise in the rate limiter.
+//   - A 401 stops the POLLING, and never the process. A revoked device that
+//     keeps polling is noise in the rate limiter; a revoked device that EXITS
+//     is worse — systemd's Restart=always turns it into 260 restarts and 560
+//     rejected heartbeats overnight until the server's login limiter locks the
+//     box out (issue #9). So: one loud line, then a 1 → 2 → 5 → 10 minute
+//     backoff on the heartbeat alone, forever, re-reading bridge.json each
+//     time so an operator's re-enrolment is picked up without a restart.
 package bridge
 
 import (
@@ -30,6 +35,7 @@ import (
 	"image"
 	_ "image/jpeg" // artifact decoders
 	_ "image/png"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"runtime"
@@ -51,7 +57,30 @@ const (
 	DefaultAckTimeout        = 60 * time.Second
 )
 
-// ErrRevoked ends Run: Orderly rejected the device token.
+// SetupSweepInterval is how often a box with NO printer assigned sweeps during
+// its first SetupWindow. An installer standing at the counter plugs a printer
+// in and must see it on the manager page within a minute — ten is long enough
+// that they leave, or start unplugging things.
+const SetupSweepInterval = 60 * time.Second
+
+// SetupWindow is how long that accelerated sweep lasts, measured from the
+// daemon's start. After it, a box with no printer is a box waiting on a human,
+// not on a sweep, and the normal 10-minute gap is the polite one.
+const SetupWindow = 15 * time.Minute
+
+// RevokedBackoff is the heartbeat retry schedule after Orderly rejects the
+// device token: 1 → 2 → 5 → 10 minutes, then 10 for as long as it takes. The
+// last step repeats; the daemon never gives up and never exits, because the
+// fix (a Reset + re-enrol) happens on a human's clock.
+var RevokedBackoff = []time.Duration{time.Minute, 2 * time.Minute, 5 * time.Minute, 10 * time.Minute}
+
+// RevokedBackoffJitter spreads each step by ±10 %, so a venue whose whole
+// fleet was revoked at once does not retry in lockstep.
+const RevokedBackoffJitter = 0.10
+
+// ErrRevoked means Orderly rejected the device token. It no longer ends Run —
+// see waitOutRevocation — but the poll cycle still reports it so a caller
+// (and `--once`) can tell an auth failure from a transient one.
 var ErrRevoked = errors.New("bridge: device token rejected — this device has been revoked in Orderly")
 
 // Sender delivers bytes to a printer and reports how many arrived.
@@ -83,6 +112,9 @@ type Bridge struct {
 
 	Logf func(format string, args ...any)
 	Now  func() time.Time
+	// Wait blocks for d or until ctx ends. Injectable so the revoked-token
+	// backoff is provable in a unit test without 18 minutes of real time.
+	Wait func(ctx context.Context, d time.Duration) error
 
 	lastHeartbeat time.Time
 	hostname      string
@@ -93,6 +125,12 @@ type Bridge struct {
 	discovered []api.DiscoveredPrinter
 	lastSweep  time.Time
 	sweeping   bool
+	// started/startedAt mark the daemon's first cycle; printersAssigned
+	// mirrors len(Cfg.Printers). All three are read by the sweep goroutine
+	// (SIGUSR1) and so live under mu rather than being read off Cfg there.
+	started          bool
+	startedAt        time.Time
+	printersAssigned int
 }
 
 // New builds a Bridge for an enrolled config with production defaults.
@@ -148,6 +186,31 @@ func (b *Bridge) defaults() {
 	if b.SweepInterval <= 0 {
 		b.SweepInterval = discover.SweepInterval
 	}
+	if b.Wait == nil {
+		b.Wait = sleepCtx
+	}
+	b.mu.Lock()
+	if !b.started {
+		b.started = true
+		b.startedAt = b.now()
+		b.printersAssigned = len(b.Cfg.Printers)
+	}
+	b.mu.Unlock()
+}
+
+// sleepCtx is the production Wait: a timer that a cancelled context beats.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 // DefaultSweep is the production sweeper: this box's own /24 on TCP 9100 plus
@@ -168,12 +231,33 @@ func (b *Bridge) SweepNow(ctx context.Context) {
 // caller and never runs two at once.
 func (b *Bridge) sweepIfDue(ctx context.Context) { b.startSweep(ctx, false) }
 
+// sweepIntervalLocked is SETUP MODE: a box with no printer assigned, inside its
+// first SetupWindow, sweeps every SetupSweepInterval instead of every ten
+// minutes. Both conditions matter — a box that already prints must not scan a
+// venue's /24 once a minute, and a box that has waited 15 minutes for an
+// assignment is waiting on a human.
+//
+// It never SLOWS a caller-set interval (a test's 10 ms stays 10 ms): the setup
+// value is a ceiling, not an override. Call with mu held.
+func (b *Bridge) sweepIntervalLocked() time.Duration {
+	interval := b.SweepInterval
+	if interval <= 0 {
+		interval = discover.SweepInterval
+	}
+	inSetup := b.printersAssigned == 0 && !b.startedAt.IsZero() &&
+		b.now().Sub(b.startedAt) < SetupWindow
+	if inSetup && interval > SetupSweepInterval {
+		return SetupSweepInterval
+	}
+	return interval
+}
+
 func (b *Bridge) startSweep(ctx context.Context, force bool) {
 	if b.Discover == nil {
 		return
 	}
 	b.mu.Lock()
-	due := force || b.lastSweep.IsZero() || b.now().Sub(b.lastSweep) >= b.SweepInterval
+	due := force || b.lastSweep.IsZero() || b.now().Sub(b.lastSweep) >= b.sweepIntervalLocked()
 	if !due || b.sweeping {
 		b.mu.Unlock()
 		return
@@ -218,7 +302,9 @@ func (b *Bridge) Discovered() []api.DiscoveredPrinter {
 	return out
 }
 
-// Run polls until the context is cancelled or the device is revoked.
+// Run polls until the context is cancelled. It returns for a signal or a
+// genuine fault — NEVER for a rejected token, which backs off in place
+// (waitOutRevocation) rather than exiting into a systemd restart loop.
 func (b *Bridge) Run(ctx context.Context) error {
 	b.defaults()
 	b.logf("bridge %s starting: device %s, venue %s, %d printer(s) assigned, polling every %s",
@@ -229,8 +315,10 @@ func (b *Bridge) Run(ctx context.Context) error {
 	for {
 		if err := b.Tick(ctx); err != nil {
 			if errors.Is(err, ErrRevoked) {
-				b.logf("%v", err)
-				return err
+				if waitErr := b.waitOutRevocation(ctx, err); waitErr != nil {
+					return waitErr
+				}
+				continue
 			}
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -245,6 +333,112 @@ func (b *Bridge) Run(ctx context.Context) error {
 		case <-ticker.C:
 		}
 	}
+}
+
+// waitOutRevocation is what a rejected token does INSTEAD of exiting.
+//
+// Issue #9: the old code returned ErrRevoked, `serve` exited 1, systemd
+// restarted it 5 s later, and one mis-pointed box produced 260 restarts / 560
+// rejected heartbeats in three hours — until production's login limiter
+// answered 429 and the box stayed locked out after the real fault was fixed.
+//
+// So the process stays up and keeps its place: polling stops (a revoked device
+// has no jobs to claim), ONE line says what is wrong and how to fix it, and
+// the heartbeat — exactly one request per step — retries on RevokedBackoff.
+// bridge.json is re-read before each attempt, because the fix is another
+// process (`orderly-print-bridge enroll`) writing that file; picking it up
+// here is what makes a re-enrolment take effect without a restart.
+//
+// It returns nil when a heartbeat succeeds (resume polling), and only ever
+// errors with the context's error.
+func (b *Bridge) waitOutRevocation(ctx context.Context, cause error) error {
+	b.logf("POLLING STOPPED — %v. This device's token is not valid on %s: it was reset or revoked in Orderly, "+
+		"or this box is pointed at the wrong Orderly. Nothing will print until that is fixed. "+
+		"Fix: in Orderly (Admin › Boxes) reset the box to issue a new setup code, then on the box run "+
+		"`orderly-print-bridge enroll --server %s --code <new code>`. "+
+		"This daemon stays up, retries the heartbeat after 1, 2, 5 then every 10 minutes, and re-reads %s "+
+		"before each try — a new enrolment resumes printing with no restart.",
+		cause, b.Cfg.ServerURL, b.Cfg.ServerURL, b.Cfg.Path())
+
+	for attempt := 0; ; attempt++ {
+		if err := b.Wait(ctx, jitter(backoffStep(attempt))); err != nil {
+			return err
+		}
+		b.reloadConfig()
+		// Force the one attempt this step is allowed: heartbeatIfDue would
+		// otherwise skip it inside HeartbeatInterval.
+		b.lastHeartbeat = time.Time{}
+		err := b.heartbeatIfDue(ctx)
+		switch {
+		case err == nil:
+			b.logf("device token accepted by %s again — polling resumed", b.Cfg.ServerURL)
+			return nil
+		case ctx.Err() != nil:
+			return ctx.Err()
+		case errors.Is(err, ErrRevoked):
+			// Still rejected. Deliberately silent: the line above already said
+			// everything true, and repeating it hourly is the noise this fix
+			// exists to remove.
+		default:
+			// A different failure (uplink, deploy) on the same schedule — say
+			// it, because it changes what the operator should look at.
+			b.logf("still not printing: heartbeat to %s failed: %v", b.Cfg.ServerURL, err)
+		}
+	}
+}
+
+// backoffStep is RevokedBackoff with its last step repeating forever.
+func backoffStep(attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	if attempt >= len(RevokedBackoff) {
+		attempt = len(RevokedBackoff) - 1
+	}
+	return RevokedBackoff[attempt]
+}
+
+// jitter spreads d by ±RevokedBackoffJitter so a fleet revoked at once does
+// not come back in lockstep.
+func jitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	spread := (rand.Float64()*2 - 1) * RevokedBackoffJitter
+	return time.Duration(float64(d) * (1 + spread))
+}
+
+// reloadConfig re-reads the config file and adopts it when the identity on
+// disk differs from the one in memory — `orderly-print-bridge enroll` is a
+// SEPARATE process writing bridge.json, and a running daemon that never looks
+// again is a daemon that needs a restart to recover. LoadFrom is a stat + a
+// ~400-byte read + one Unmarshal, so once per backoff step costs nothing.
+//
+// Only ever called from the Run goroutine.
+func (b *Bridge) reloadConfig() bool {
+	path := b.Cfg.Path()
+	if path == "" {
+		return false
+	}
+	fresh, err := config.LoadFrom(path)
+	if err != nil || !fresh.Enrolled() {
+		return false
+	}
+	if fresh.Token.Reveal() == b.Cfg.Token.Reveal() && fresh.ServerURL == b.Cfg.ServerURL {
+		return false
+	}
+	b.logf("a new enrolment is on disk at %s (device %s, venue %s, server %s); adopting it",
+		path, fresh.DeviceID, fresh.VenueID, fresh.ServerURL)
+	b.Cfg = fresh
+	b.Client = api.New(fresh.ServerURL, fresh.Token)
+	b.lastHeartbeat = time.Time{}
+	b.mu.Lock()
+	b.printersAssigned = len(fresh.Printers)
+	// A fresh enrolment is a fresh setup: the operator who just re-enrolled
+	// is standing at the counter, so the 60 s setup sweep re-opens for them.
+	b.startedAt = b.now()
+	b.mu.Unlock()
+	return true
 }
 
 // Tick runs one heartbeat-if-due + poll + (maybe) one job. Exported so tests
@@ -267,9 +461,16 @@ func (b *Bridge) Tick(ctx context.Context) error {
 	return b.handle(ctx, resp.Job)
 }
 
-// classify turns a 401 into the loop-stopping ErrRevoked.
+// classify turns an auth rejection into ErrRevoked, which parks the loop.
+//
+// 429 is in the list on purpose: on the bearer path Orderly answers
+// too_many_failed_authentications from a per-IP window (20 in 15 min) after
+// repeated 401s — the poll endpoint has no limiter and the heartbeat throttle
+// is a SQL predicate, so a 429 here can only mean "locked out for rejecting".
+// Treating it as transient kept a locked-out box hammering every 3 s for the
+// whole window and never re-reading bridge.json (v1.2.0 review).
 func (b *Bridge) classify(err error) error {
-	if api.IsStatus(err, http.StatusUnauthorized) || api.IsStatus(err, http.StatusForbidden) {
+	if api.IsStatus(err, http.StatusUnauthorized) || api.IsStatus(err, http.StatusForbidden) || api.IsStatus(err, http.StatusTooManyRequests) {
 		return fmt.Errorf("%w (%v)", ErrRevoked, err)
 	}
 	return err
@@ -310,6 +511,9 @@ func (b *Bridge) applyPrinters(printers []api.Printer) {
 		return
 	}
 	b.Cfg.Printers = printers
+	b.mu.Lock()
+	b.printersAssigned = len(printers)
+	b.mu.Unlock()
 	if err := b.Cfg.Save(); err != nil {
 		b.logf("could not persist the printer assignment: %v", err)
 		return

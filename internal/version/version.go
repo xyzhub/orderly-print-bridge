@@ -10,13 +10,13 @@ import "strings"
 //
 // It is a VAR, not a const, because release.yml stamps the tag into it:
 //
-//	-ldflags "-X github.com/xyz/orderly-print-bridge/internal/version.Version=1.1.0"
+//	-ldflags "-X github.com/xyz/orderly-print-bridge/internal/version.Version=1.2.0"
 //
 // A `-X` on a const is silently ignored by the linker, which is how a release
 // binary ends up reporting the developer's placeholder for a year. The default
 // below is what an unstamped `go build` produces; bump it in the same commit as
 // any behaviour change the server may need to reason about.
-var Version = "1.1.0"
+var Version = "1.2.0"
 
 // UserAgent is the HTTP User-Agent every agent call carries. A func, not a
 // const, so it follows a stamped Version instead of freezing the default at
