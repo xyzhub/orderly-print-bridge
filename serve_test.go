@@ -178,7 +178,13 @@ func TestFirstEnrolmentWithoutAServerURLStillFails(t *testing.T) {
 	if err == nil {
 		t.Fatal("want an error when there is no server URL anywhere")
 	}
-	if !strings.Contains(err.Error(), "not enrolled and no --server was given") {
+	// Never the word "enrolled": install.sh classifies the install outcome by
+	// grepping the journal for `*enrolled*` FIRST, so that word in a failure
+	// line reports a dead box as a success (v1.2.0 review).
+	if strings.Contains(err.Error(), "enrolled") {
+		t.Fatalf("the no-server error must not contain the word 'enrolled': %v", err)
+	}
+	if !strings.Contains(err.Error(), "holds no device token and no --server was given") {
 		t.Fatalf("error changed shape: %v", err)
 	}
 }

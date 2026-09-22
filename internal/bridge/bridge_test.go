@@ -7,6 +7,7 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -828,5 +829,22 @@ func TestSweepFailureDoesNotBreakTheLoop(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if b.Discovered() != nil {
 		t.Fatal("a failed sweep must not publish candidates")
+	}
+}
+
+// A 429 on the bearer path is Orderly's lockout after repeated rejections —
+// the poll endpoint has no limiter and the heartbeat throttle is a SQL
+// predicate — so it parks the loop exactly like a 401. Treating it as
+// transient kept a locked-out box hammering every 3 s for the whole window.
+func TestLockedOutIsClassifiedLikeRevoked(t *testing.T) {
+	b := &Bridge{}
+	for _, code := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusTooManyRequests} {
+		err := b.classify(&api.Error{Status: code, Code: "x"})
+		if !errors.Is(err, ErrRevoked) {
+			t.Fatalf("status %d must classify as ErrRevoked, got %v", code, err)
+		}
+	}
+	if err := b.classify(&api.Error{Status: http.StatusBadGateway, Code: "x"}); errors.Is(err, ErrRevoked) {
+		t.Fatalf("a 502 is transient, not a revocation")
 	}
 }

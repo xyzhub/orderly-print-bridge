@@ -434,6 +434,9 @@ func (b *Bridge) reloadConfig() bool {
 	b.lastHeartbeat = time.Time{}
 	b.mu.Lock()
 	b.printersAssigned = len(fresh.Printers)
+	// A fresh enrolment is a fresh setup: the operator who just re-enrolled
+	// is standing at the counter, so the 60 s setup sweep re-opens for them.
+	b.startedAt = b.now()
 	b.mu.Unlock()
 	return true
 }
@@ -458,9 +461,16 @@ func (b *Bridge) Tick(ctx context.Context) error {
 	return b.handle(ctx, resp.Job)
 }
 
-// classify turns a 401 into the loop-stopping ErrRevoked.
+// classify turns an auth rejection into ErrRevoked, which parks the loop.
+//
+// 429 is in the list on purpose: on the bearer path Orderly answers
+// too_many_failed_authentications from a per-IP window (20 in 15 min) after
+// repeated 401s — the poll endpoint has no limiter and the heartbeat throttle
+// is a SQL predicate, so a 429 here can only mean "locked out for rejecting".
+// Treating it as transient kept a locked-out box hammering every 3 s for the
+// whole window and never re-reading bridge.json (v1.2.0 review).
 func (b *Bridge) classify(err error) error {
-	if api.IsStatus(err, http.StatusUnauthorized) || api.IsStatus(err, http.StatusForbidden) {
+	if api.IsStatus(err, http.StatusUnauthorized) || api.IsStatus(err, http.StatusForbidden) || api.IsStatus(err, http.StatusTooManyRequests) {
 		return fmt.Errorf("%w (%v)", ErrRevoked, err)
 	}
 	return err

@@ -56,7 +56,7 @@ const enrollUsage = `orderly-print-bridge enroll — claim a setup code, store t
 
 FLAGS
   --server <url>       Orderly base URL (required for the first enrolment;
-                       otherwise /etc/orderly/server-url, then the stored one)
+                       otherwise the stored one, then /etc/orderly/server-url)
   --config <path>      config file (default: the OS location)
   --setup-code <path>  per-flash setup code file (default /etc/orderly/setup-code)
   --code <code>        setup code, typed instead of read from the file
@@ -275,7 +275,7 @@ func loadOrEnroll(ctx context.Context, c *commonFlags) (*config.Config, error) {
 		serverURL = serverURLFromFile(c)
 	}
 	if serverURL == "" {
-		return nil, fmt.Errorf("this device is not enrolled and no --server was given (and no server URL at %s)",
+		return nil, fmt.Errorf("this device holds no device token and no --server was given (and no server URL at %s)",
 			config.ServerURLPath(c.path()))
 	}
 
