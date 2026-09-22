@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -27,7 +28,10 @@ const serveUsage = `orderly-print-bridge serve — run the print daemon
 
 FLAGS
   --server <url>       Orderly base URL (e.g. https://orderly-staging.fly.dev)
-                       Only needed for the first enrollment; then it is stored.
+                       FIRST ENROLMENT ONLY. Once this device holds a token,
+                       bridge.json's serverUrl is the truth and this flag is
+                       ignored (with a log line). Default before enrolment:
+                       /etc/orderly/server-url, beside the setup code.
   --config <path>      config file (default: the OS location, see docs)
   --setup-code <path>  per-flash setup code file (default /etc/orderly/setup-code)
   --code <code>        setup code, typed instead of read from the file
@@ -45,8 +49,14 @@ SIGNALS
 
 const enrollUsage = `orderly-print-bridge enroll — claim a setup code, store the token, exit
 
+  This is the ONLY way to move an already-enrolled box to another Orderly: it
+  replaces the stored token, server URL and ids with the ones the new setup
+  code mints. Get that code from Orderly (Admin › Boxes › Issue a new setup
+  code) — a Reset there is what makes the old token dead.
+
 FLAGS
-  --server <url>       Orderly base URL (required)
+  --server <url>       Orderly base URL (required for the first enrolment;
+                       otherwise /etc/orderly/server-url, then the stored one)
   --config <path>      config file (default: the OS location)
   --setup-code <path>  per-flash setup code file (default /etc/orderly/setup-code)
   --code <code>        setup code, typed instead of read from the file
@@ -81,6 +91,31 @@ func (c *commonFlags) path() string {
 	return config.DefaultPath()
 }
 
+// serverURLFromFile is the PRE-ENROLMENT default for --server: the URL the
+// installer wrote beside the setup code (/etc/orderly/server-url). It is read
+// only when this device holds no token, so a fresh box's unit can be a bare
+// `serve` — the flag that re-pointed an enrolled box is then not there to be
+// inherited by the next reboot (issue #10).
+//
+// Every failure is "" and a log line: a hint file is a convenience, and the
+// operator's own --server (or an existing enrolment) must still decide.
+func serverURLFromFile(c *commonFlags) string {
+	path := config.ServerURLPath(c.path())
+	url, err := config.ReadServerURL(path)
+	switch {
+	case err == nil:
+		// Deliberately does not say "not enrolled": install.sh classifies the
+		// journal by substring and `*enrolled*` would read this as success.
+		logger.Printf("no device token yet; using the server URL from %s: %s", path, url)
+		return url
+	case errors.Is(err, os.ErrNotExist):
+		return ""
+	default:
+		logger.Printf("ignoring %s: %v", path, err)
+		return ""
+	}
+}
+
 func (c *commonFlags) enrollOptions(serverURL string, onTailnet func(tailnet.Join)) enroll.Options {
 	return enroll.Options{
 		ServerURL:      serverURL,
@@ -96,14 +131,14 @@ func (c *commonFlags) enrollOptions(serverURL string, onTailnet func(tailnet.Joi
 // joinTailnet runs `tailscale up` with the key the server minted. Every failure
 // is a warning: a box that cannot reach the tailnet must still print (LD-17),
 // and support reachability is not worth a daemon that refuses to start.
-func joinTailnet(ctx context.Context, join tailnet.Join) {
-	j := &tailnet.Joiner{Logf: logger.Printf}
+func joinTailnet(ctx context.Context, join tailnet.Join, logf func(string, ...any)) {
+	j := &tailnet.Joiner{Logf: logf}
 	if err := j.Up(ctx, join); err != nil {
 		if errors.Is(err, tailnet.ErrNoKey) || errors.Is(err, tailnet.ErrNotInstalled) {
 			// Already said its one line, at the right volume.
 			return
 		}
-		logger.Printf("tailnet join failed (printing is unaffected): %v", err)
+		logf("tailnet join failed (printing is unaffected): %v", err)
 	}
 }
 
@@ -113,7 +148,11 @@ func joinTailnet(ctx context.Context, join tailnet.Join) {
 // moved on is a worse state than one that finishes.
 func joinTailnetInBackground(ctx context.Context, join tailnet.Join) {
 	detached := context.WithoutCancel(ctx)
-	go joinTailnet(detached, join)
+	// The log sink is bound HERE, on the caller's goroutine: a detached
+	// goroutine that reads the package logger minutes later races anything
+	// that replaces it.
+	logf := logger.Printf
+	go joinTailnet(detached, join, logf)
 }
 
 func runEnroll(args []string) error {
@@ -132,6 +171,9 @@ func runEnroll(args []string) error {
 		}
 	}
 	if serverURL == "" {
+		serverURL = serverURLFromFile(&c)
+	}
+	if serverURL == "" {
 		fs.Usage()
 		return errors.New("--server is required for the first enrollment")
 	}
@@ -141,7 +183,7 @@ func runEnroll(args []string) error {
 	// The one-shot `enroll` command joins SYNCHRONOUSLY: the process is about
 	// to exit, and a backgrounded join would be killed mid-flight.
 	_, err := enroll.Run(ctx, c.enrollOptions(serverURL, func(join tailnet.Join) {
-		joinTailnet(ctx, join)
+		joinTailnet(ctx, join, logger.Printf)
 	}))
 	return err
 }
@@ -184,33 +226,41 @@ func runServe(args []string) error {
 	// install it). The install path of record is still the nightly timer.
 	watchForUpdates(ctx, *updateEvery, *autoUpdate, *unit)
 
+	// b.Run no longer returns ErrRevoked: a rejected token now backs off inside
+	// the loop (1 → 2 → 5 → 10 min) instead of exiting into systemd's
+	// `Restart=always RestartSec=5`, which turned one revoked box into 260
+	// restarts and a 429 lockout overnight (issue #9). The only exits left are
+	// a signal and a genuine fault.
 	err = b.Run(ctx)
-	switch {
-	case errors.Is(err, context.Canceled):
+	if errors.Is(err, context.Canceled) {
 		logger.Printf("bridge %s stopped", version.Version)
 		return nil
-	case errors.Is(err, bridge.ErrRevoked):
-		// Exit non-zero so systemd/Docker surface it, but say the operator
-		// word ("revoked"), not the HTTP status.
-		return err
-	default:
-		return err
 	}
+	return err
 }
 
 // loadOrEnroll returns an enrolled config, enrolling if the device has no
 // token yet. A missing config on a freshly flashed box is the normal path, not
 // an error.
+//
+// ONCE ENROLLED, bridge.json IS THE TRUTH. A `--server` that disagrees is
+// reported and ignored, never written: the flag lives in a systemd unit that
+// outlives the install which wrote it, and on 2026-09-21 that rewrite pointed
+// a staging box's token at production on a routine reboot — 401, restart loop,
+// rate-limit lockout, with nothing wrong on either server (issue #10). Moving
+// a box between Orderlys is a deliberate re-enrolment, never a flag.
 func loadOrEnroll(ctx context.Context, c *commonFlags) (*config.Config, error) {
 	cfg, err := config.LoadFrom(c.path())
 	switch {
 	case err == nil && cfg.Enrolled():
-		if c.server != "" && c.server != cfg.ServerURL {
-			logger.Printf("server URL changed to %s", c.server)
-			cfg.ServerURL = c.server
-			if saveErr := cfg.Save(); saveErr != nil {
-				return nil, saveErr
-			}
+		if c.server != "" && strings.TrimRight(c.server, "/") != strings.TrimRight(cfg.ServerURL, "/") {
+			// Deliberately avoids the word install.sh greps for as success
+			// (`*enrolled*`); this is a warning, not an enrolment.
+			logger.Printf("IGNORING --server %s: this device already holds a device token for %s, "+
+				"and a box that holds one never changes server because of a flag. "+
+				"To move it, issue a new setup code in Orderly (Admin › Boxes › Reset) and run: "+
+				"orderly-print-bridge enroll --server %s --code <new code>",
+				c.server, cfg.ServerURL, c.server)
 		}
 		return cfg, nil
 	case err != nil && !errors.Is(err, config.ErrNotFound):
@@ -222,7 +272,11 @@ func loadOrEnroll(ctx context.Context, c *commonFlags) (*config.Config, error) {
 		serverURL = cfg.ServerURL
 	}
 	if serverURL == "" {
-		return nil, errors.New("this device is not enrolled and no --server was given")
+		serverURL = serverURLFromFile(c)
+	}
+	if serverURL == "" {
+		return nil, fmt.Errorf("this device is not enrolled and no --server was given (and no server URL at %s)",
+			config.ServerURLPath(c.path()))
 	}
 
 	// Enrollment must not depend on Tailscale or anything else being up
