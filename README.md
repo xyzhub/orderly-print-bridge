@@ -61,7 +61,7 @@ fetches are published by this repo's `release.yml`.)
 By hand, from the release:
 
 ```bash
-TAG=v1.1.0
+TAG=v1.2.0
 ARCH=amd64                                   # or arm64
 BASE=https://github.com/xyzhub/orderly-print-bridge/releases/download/$TAG
 curl -fsSLO $BASE/orderly-print-bridge-linux-$ARCH
@@ -275,16 +275,37 @@ The `GS v 0` raster bit-image command is supported by ~all 80mm thermal printers
 ## The daemon (`serve`)
 
 ```bash
-# First run on a box: reads the per-flash setup code from /etc/orderly/setup-code,
-# reads the DMI serial, enrolls, then polls every 3s.
+# First run on a box: reads the server URL from /etc/orderly/server-url and the
+# per-flash setup code from /etc/orderly/setup-code, reads the DMI serial,
+# enrolls, then polls every 3s. No flags — this is what the systemd unit runs.
+orderly-print-bridge serve
+
+# First enrolment on a machine the installer did not prepare
 orderly-print-bridge serve --server https://orderly-staging.fly.dev
 
-# Enroll only (store the token and exit)
+# Enroll only (store the token and exit). This is also the ONLY way to move an
+# already-enrolled box to another Orderly.
 orderly-print-bridge enroll --server https://orderly.example --code ABCDEFGHJK
 
 # One poll cycle, for a smoke test
 orderly-print-bridge serve --once
 ```
+
+**Which server a box talks to.** In order: the `serverUrl` in `bridge.json`
+once this device holds a token — **always, and nothing overrides it**; else
+`--server`; else the `server-url` file beside the config (`/etc/orderly/server-url`,
+written by `install.sh` next to the setup code).
+
+> **An enrolled box never changes server because of a flag.** A `--server` that
+> disagrees with the stored `serverUrl` is logged and **ignored**; it used to
+> rewrite the config on every start. A unit file outlives the install that
+> wrote it, so on 2026-09-21 a box enrolled to staging was silently re-pointed
+> at production on a reboot, presented its staging token 560 times, and was
+> rate-limited out (#10). Moving a box between Orderlys is a deliberate act:
+> reset it in Orderly (Admin › Boxes) to mint a new setup code, then run
+> `orderly-print-bridge enroll --server <url> --code <new code>` on the box —
+> which replaces the token, the server URL and the ids, and re-learns the
+> printer assignment from the next heartbeat.
 
 **Config file** — `{serverUrl, token, deviceId, venueId, printers[]}`, mode
 **0600**, at one path per OS:
@@ -295,8 +316,10 @@ orderly-print-bridge serve --once
 | macOS | `/Library/Application Support/Orderly/bridge.json` |
 | Windows | `%ProgramData%\Orderly\bridge.json` (ACL: SYSTEM + Administrators) |
 
-`ORDERLY_BRIDGE_CONFIG` overrides the path. A world-readable file is rewritten
-to 0600 on load. The device token is a redacting type — it cannot reach stdout,
+`ORDERLY_BRIDGE_CONFIG` overrides the path. Two 0600 files the installer writes
+live in that same directory and are read **only before enrolment**:
+`setup-code` (the per-flash code) and `server-url` (the Orderly to claim it
+against). A world-readable config file is rewritten to 0600 on load. The device token is a redacting type — it cannot reach stdout,
 a log line, an error string or an accidental `json.Marshal`; only the config
 file and the `Authorization` header ever hold the real value.
 
@@ -322,7 +345,13 @@ the binary serves a setup page on `http://127.0.0.1:47831/` as a last resort.
   > **Whether the Bixolon SRP-E300 answers `GS I` is UNKNOWN** as of this
   > build. It has not been tried on a bench. Do not assume it replies.
 - **Every job is acked within 60 s** or acked `failed{timeout}`.
-- **A 401 stops the loop** and reports "revoked".
+- **A 401 stops the polling, never the process.** One loud line names the fix,
+  then the heartbeat alone retries at **1 → 2 → 5 → 10 minutes** (±10 % jitter,
+  10 minutes thereafter, forever), re-reading `bridge.json` before each try so
+  a re-enrolment done on the box resumes printing **without a restart**.
+  Exiting was worse than looping: `Restart=always RestartSec=5` turned one
+  revoked box into 260 restarts and 560 rejected heartbeats overnight, until
+  the server's limiter answered `429 too_many_failed_authentications` (#9).
 - **A discovered printer is never printed to.** The sweep below is a list a
   human reads; routing comes only from the server's assignment.
 
@@ -336,7 +365,11 @@ systemctl kill -s USR1 orderly-bridge  # make the daemon sweep right now
 ```
 
 The daemon sweeps at most **every 10 minutes** (and on `SIGUSR1`) and reports
-what it found on the next heartbeat, capped at 50 entries. It is bounded on
+what it found on the next heartbeat, capped at 50 entries. **Setup mode:** a box
+with **no printer assigned** sweeps every **60 s** for its first **15 minutes**,
+so an installer standing at the counter sees the printer they just plugged in
+on the manager page within a minute. Once a printer is assigned, or after those
+15 minutes, it is back to ten. It is bounded on
 every axis, because a discovery feature that saturates a venue's switch during
 service is worse than none: **this box's own /24 only** (a /16 is narrowed to
 the /24 around us), TCP **9100** only, 32 concurrent dials, a 300 ms dial
